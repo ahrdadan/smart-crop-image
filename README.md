@@ -174,6 +174,8 @@ Output yang dihasilkan:
   `1` (default) untuk auto-test sample, `0` untuk skip test.
 - `SAMPLE_APPLY_CROP`  
   `1` (default) untuk test dengan crop fisik jika `vips` tersedia, `0` untuk test koordinat saja.
+- `AUTO_PORT_FALLBACK`  
+  `1` (default) jika port dipakai proses lain maka otomatis pindah ke port kosong berikutnya.
 - `LOG_FILE`  
   Path log gabungan. Default `logs/start_background_<timestamp>.log`.
 - `THUMBNAIL_WORKER_PATH`  

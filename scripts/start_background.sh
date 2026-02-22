@@ -19,6 +19,7 @@ PAYLOAD_FILE="${PAYLOAD_FILE:-$OUT_DIR/thumbnail_payload.json}"
 OUTPUT_IMAGE="${OUTPUT_IMAGE:-$OUT_DIR/chapter-thumbnail.jpg}"
 RUN_SAMPLE_TEST="${RUN_SAMPLE_TEST:-1}"
 SAMPLE_APPLY_CROP="${SAMPLE_APPLY_CROP:-1}"
+AUTO_PORT_FALLBACK="${AUTO_PORT_FALLBACK:-1}"
 GO_VERSION="${GO_VERSION:-1.22.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-$HOME/.local}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/start_background_$(date +%Y%m%d_%H%M%S).log}"
@@ -258,6 +259,44 @@ create_or_repair_venv() {
   python3 -m virtualenv "$VENV_DIR"
 }
 
+health_ok() {
+  local port="$1"
+  curl -fsS "http://$HOST:$port/healthz" >/dev/null 2>&1
+}
+
+port_is_listening() {
+  local port="$1"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "( sport = :$port )" 2>/dev/null | grep -q ":$port" && return 0
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -E "[\.\:]$port[[:space:]].*LISTEN" >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
+
+find_available_port() {
+  local start="$1"
+  local max_tries="${2:-50}"
+  local candidate="$start"
+  local i
+  for ((i=0; i<max_tries; i++)); do
+    if ! port_is_listening "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+  return 1
+}
+
 run_sample_test() {
   if [[ "$RUN_SAMPLE_TEST" != "1" ]]; then
     echo "Sample test disabled (RUN_SAMPLE_TEST=$RUN_SAMPLE_TEST)"
@@ -375,6 +414,31 @@ python3 -m pip install -r requirements.txt
 
 go build -o "$BIN_PATH" .
 
+if health_ok "$PORT"; then
+  echo "Existing server is already healthy on http://$HOST:$PORT, reusing it."
+  run_sample_test
+  echo "Log: $LOG_FILE"
+  exit 0
+fi
+
+if port_is_listening "$PORT"; then
+  echo "Port $PORT is already in use but health check failed."
+  if [[ "$AUTO_PORT_FALLBACK" == "1" ]]; then
+    NEW_PORT="$(find_available_port $((PORT + 1)) 50 || true)"
+    if [[ -z "${NEW_PORT:-}" ]]; then
+      echo "No available fallback port found."
+      echo "Log: $LOG_FILE"
+      exit 1
+    fi
+    echo "Switching to available port: $NEW_PORT"
+    PORT="$NEW_PORT"
+  else
+    echo "Auto port fallback disabled (AUTO_PORT_FALLBACK=$AUTO_PORT_FALLBACK)."
+    echo "Log: $LOG_FILE"
+    exit 1
+  fi
+fi
+
 echo "Starting server in background on http://$HOST:$PORT"
 nohup env PORT="$PORT" THUMBNAIL_WORKER_PATH="$ROOT_DIR/thumbnail_worker.py" "$BIN_PATH" >>"$LOG_FILE" 2>&1 &
 NEW_PID=$!
@@ -388,6 +452,11 @@ for _ in {1..30}; do
     run_sample_test
     echo "Log: $LOG_FILE"
     exit 0
+  fi
+  if ! kill -0 "$NEW_PID" 2>/dev/null; then
+    echo "Server process exited before becoming healthy (PID: $NEW_PID)."
+    echo "Log: $LOG_FILE"
+    exit 1
   fi
   sleep 1
 done
