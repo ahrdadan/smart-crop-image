@@ -27,6 +27,8 @@ DEFAULT_RATIO = 16.0 / 9.0
 DEFAULT_MAX_ANALYSIS_SIZE = 512
 SALIENCY_ACCEPT_THRESHOLD = 0.6
 FACE_ACCEPT_THRESHOLD = 0.5
+FACE_OVERRIDE_THRESHOLD = 0.35
+BALLOON_RISK_OVERRIDE_THRESHOLD = 0.45
 
 _ONNX_FACE_SESSION: Any = None
 
@@ -205,13 +207,28 @@ def _region_quality(gray: np.ndarray) -> float:
     if gray.size == 0:
         return 0.0
 
+    white_ratio, text_density, low_contrast_penalty = _region_stats(gray)
+
+    score = 1.0 - (0.55 * white_ratio + 0.25 * low_contrast_penalty + 0.30 * text_density)
+    return _clamp(score, 0.0, 1.0)
+
+
+def _region_stats(gray: np.ndarray) -> Tuple[float, float, float]:
+    if gray.size == 0:
+        return 0.0, 0.0, 1.0
     white_ratio = float(np.mean(gray >= 245))
     contrast = float(np.std(gray))
     low_contrast_penalty = _clamp(1.0 - contrast / 64.0, 0.0, 1.0)
     text_density = _estimate_text_density(gray)
+    return white_ratio, text_density, low_contrast_penalty
 
-    score = 1.0 - (0.55 * white_ratio + 0.25 * low_contrast_penalty + 0.30 * text_density)
-    return _clamp(score, 0.0, 1.0)
+
+def _balloon_risk(gray: np.ndarray) -> float:
+    if gray.size == 0:
+        return 0.0
+    white_ratio, text_density, low_contrast_penalty = _region_stats(gray)
+    risk = 0.60 * white_ratio + 0.60 * text_density + 0.25 * low_contrast_penalty
+    return _clamp(risk, 0.0, 1.0)
 
 
 def _crop_region_gray(gray: np.ndarray, crop: Tuple[int, int, int, int]) -> np.ndarray:
@@ -368,7 +385,7 @@ def _saliency_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Tuple[int, i
             saliency_map = _fallback_saliency_map(gray)
 
         saliency_map = _normalize_map(saliency_map)
-        threshold = float(np.quantile(saliency_map, 0.70))
+        threshold = float(np.quantile(saliency_map, 0.75))
         mask = saliency_map >= threshold
         if not np.any(mask):
             mask = saliency_map > 0
@@ -770,6 +787,7 @@ def main() -> None:
     if img is not None and cv2 is not None:
         analysis = _resize_for_analysis(img, max_analysis_size)
         ah, aw = analysis.shape[:2]
+        gray_analysis = cv2.cvtColor(analysis, cv2.COLOR_BGR2GRAY)
         analysis_fallback = _fallback_crop_with_analysis(analysis, ratio)
         crop = _map_crop_to_original(analysis_fallback, aw, ah, orig_w, orig_h, ratio)
         crop = _ensure_in_bounds(*crop, orig_w, orig_h, ratio)
@@ -777,20 +795,37 @@ def main() -> None:
         sal_crop, sal_conf = _saliency_crop(analysis, ratio)
         mapped_sal_crop = _map_crop_to_original(sal_crop, aw, ah, orig_w, orig_h, ratio)
         mapped_sal_crop = _ensure_in_bounds(*mapped_sal_crop, orig_w, orig_h, ratio)
+        sal_gray = _crop_region_gray(gray_analysis, sal_crop)
+        sal_balloon_risk = _balloon_risk(sal_gray)
+        sal_effective_conf = _clamp(sal_conf - 0.35 * sal_balloon_risk, 0.0, 1.0)
 
-        if sal_conf >= SALIENCY_ACCEPT_THRESHOLD:
+        face_crop, face_conf = _face_crop(analysis, ratio)
+        mapped_face_crop = None
+        face_effective_conf = 0.0
+        if face_crop is not None:
+            mapped_face_crop = _map_crop_to_original(face_crop, aw, ah, orig_w, orig_h, ratio)
+            mapped_face_crop = _ensure_in_bounds(*mapped_face_crop, orig_w, orig_h, ratio)
+            face_gray = _crop_region_gray(gray_analysis, face_crop)
+            face_quality = _region_quality(face_gray)
+            face_effective_conf = _clamp(0.85 * face_conf + 0.15 * face_quality, 0.0, 1.0)
+
+        use_face = False
+        if mapped_face_crop is not None:
+            if sal_balloon_risk >= BALLOON_RISK_OVERRIDE_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
+                use_face = True
+            elif face_effective_conf >= FACE_ACCEPT_THRESHOLD and face_effective_conf >= sal_effective_conf - 0.03:
+                use_face = True
+            elif sal_effective_conf < SALIENCY_ACCEPT_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
+                use_face = True
+
+        if use_face and mapped_face_crop is not None:
+            crop = mapped_face_crop
+            method = "face"
+            confidence = face_effective_conf
+        elif sal_effective_conf >= SALIENCY_ACCEPT_THRESHOLD:
             crop = mapped_sal_crop
             method = "saliency"
-            confidence = sal_conf
-        else:
-            face_crop, face_conf = _face_crop(analysis, ratio)
-            if face_crop is not None:
-                mapped_face_crop = _map_crop_to_original(face_crop, aw, ah, orig_w, orig_h, ratio)
-                mapped_face_crop = _ensure_in_bounds(*mapped_face_crop, orig_w, orig_h, ratio)
-                if face_conf >= FACE_ACCEPT_THRESHOLD:
-                    crop = mapped_face_crop
-                    method = "face"
-                    confidence = face_conf
+            confidence = sal_effective_conf
 
     crop = _ensure_in_bounds(*crop, orig_w, orig_h, ratio)
     result = _build_result(crop[0], crop[1], crop[2], crop[3], method, confidence)

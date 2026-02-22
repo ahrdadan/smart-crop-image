@@ -16,8 +16,8 @@ Project ini berisi arsitektur **Go + Python worker** untuk generate area crop th
 Urutan sesuai requirement:
 
 1. Preprocess: load image, resize max-side 512 (analysis only), grayscale untuk analisis.
-2. Saliency (primary): SpectralResidual/OpenCV, top 30% saliency, expand ke 16:9, score confidence.
-3. Face detection (secondary): dipakai jika confidence saliency rendah. Prioritas model ONNX (`onnxruntime`, CPU) lalu fallback ke cascade.
+2. Saliency (primary): SpectralResidual/OpenCV, top saliency, expand ke 16:9, score confidence + penalti area text/balloon.
+3. Face detection (AI-assisted): model ONNX (`onnxruntime`, CPU) diprioritaskan, lalu fallback ke cascade. Jika area saliency berisiko balloon-text, face dapat override.
 4. Fallback deterministic (mandatory): top-biased crop (~18%), full width jika memungkinkan.
 5. Output JSON wajib (tidak pernah `null`, tidak di luar bounds).
 

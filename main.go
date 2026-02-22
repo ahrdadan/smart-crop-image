@@ -385,9 +385,9 @@ func scoreCandidate(crop CropResult) float64 {
 	methodWeight := 0.5
 	switch strings.ToLower(strings.TrimSpace(crop.Method)) {
 	case "saliency":
-		methodWeight = 1.0
+		methodWeight = 0.9
 	case "face":
-		methodWeight = 0.85
+		methodWeight = 1.0
 	case "fallback":
 		methodWeight = 0.55
 	}
