@@ -19,6 +19,7 @@ PAYLOAD_FILE="${PAYLOAD_FILE:-$OUT_DIR/thumbnail_payload.json}"
 OUTPUT_IMAGE="${OUTPUT_IMAGE:-$OUT_DIR/chapter-thumbnail.jpg}"
 RUN_SAMPLE_TEST="${RUN_SAMPLE_TEST:-1}"
 SAMPLE_APPLY_CROP="${SAMPLE_APPLY_CROP:-1}"
+SAMPLE_COMPOSE_MODE="${SAMPLE_COMPOSE_MODE:-single}"
 AUTO_PORT_FALLBACK="${AUTO_PORT_FALLBACK:-1}"
 GO_VERSION="${GO_VERSION:-1.22.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-$HOME/.local}"
@@ -314,14 +315,15 @@ run_sample_test() {
     apply_crop=1
   fi
 
-  python3 - "$PAYLOAD_FILE" "$OUTPUT_IMAGE" "$apply_crop" "${IMAGES[@]}" <<'PY'
+  python3 - "$PAYLOAD_FILE" "$OUTPUT_IMAGE" "$apply_crop" "$SAMPLE_COMPOSE_MODE" "${IMAGES[@]}" <<'PY'
 import json
 import sys
 
 payload_path = sys.argv[1]
 output_image = sys.argv[2]
 apply_crop = sys.argv[3] == "1"
-image_paths = sys.argv[4:]
+compose_mode = sys.argv[4].strip().lower()
+image_paths = sys.argv[5:]
 
 payload = {
     "image_paths": image_paths,
@@ -331,6 +333,8 @@ payload = {
     "quality": 85,
     "return_candidates": True,
 }
+if compose_mode in ("single", "pair"):
+    payload["compose_mode"] = compose_mode
 if apply_crop:
     payload["output_path"] = output_image
 

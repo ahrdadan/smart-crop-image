@@ -231,6 +231,21 @@ def _balloon_risk(gray: np.ndarray) -> float:
     return _clamp(risk, 0.0, 1.0)
 
 
+def _face_region_valid(gray_region: np.ndarray) -> bool:
+    if gray_region.size == 0:
+        return False
+    white_ratio, text_density, low_contrast_penalty = _region_stats(gray_region)
+    if text_density > 0.23:
+        return False
+    if white_ratio > 0.86 and text_density > 0.10:
+        return False
+    if white_ratio > 0.92:
+        return False
+    if low_contrast_penalty > 0.88 and text_density > 0.10:
+        return False
+    return True
+
+
 def _crop_region_gray(gray: np.ndarray, crop: Tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = crop
     x = max(0, min(x, gray.shape[1] - 1))
@@ -604,6 +619,17 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
             x1, y1, x2, y2, det_score = onnx_faces[0]
             fw = max(1, x2 - x1)
             fh = max(1, y2 - y1)
+            face_aspect = float(fw) / float(max(1, fh))
+            face_area_ratio = float(fw * fh) / float(max(1, w * h))
+            if face_aspect < 0.5 or face_aspect > 1.8:
+                return None, 0.0
+            if face_area_ratio < 0.008 or face_area_ratio > 0.45:
+                return None, 0.0
+
+            face_region = _crop_region_gray(gray, (x1, y1, fw, fh))
+            if not _face_region_valid(face_region):
+                return None, 0.0
+
             cx = x1 + fw / 2.0
             cy = y1 + fh / 2.0
             padded_w = fw * 2.8
@@ -612,9 +638,13 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
             crop = _crop_from_center(cx, cy, target_w, target_h, w, h)
             crop_gray = _crop_region_gray(gray, crop)
             quality = _region_quality(crop_gray)
+            balloon_risk = _balloon_risk(crop_gray)
 
-            face_area_ratio = float(fw * fh) / float(max(1, w * h))
             conf = _clamp(0.50 * float(det_score) + 0.30 * quality + 0.20 * math.sqrt(max(0.0, face_area_ratio)), 0.0, 1.0)
+            conf = conf * (1.0 - 0.65 * balloon_risk)
+            if balloon_risk > 0.55:
+                conf = conf * 0.35
+            conf = _clamp(conf, 0.0, 1.0)
             return crop, conf
     except Exception:
         pass
@@ -637,6 +667,17 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
 
         faces = sorted(faces, key=lambda f: int(f[2]) * int(f[3]), reverse=True)
         fx, fy, fw, fh = [int(v) for v in faces[0]]
+        face_aspect = float(fw) / float(max(1, fh))
+        face_area_ratio = float(fw * fh) / float(max(1, w * h))
+        if face_aspect < 0.5 or face_aspect > 1.8:
+            return None, 0.0
+        if face_area_ratio < 0.008 or face_area_ratio > 0.45:
+            return None, 0.0
+
+        face_region = _crop_region_gray(gray, (fx, fy, fw, fh))
+        if not _face_region_valid(face_region):
+            return None, 0.0
+
         cx = fx + fw / 2.0
         cy = fy + fh / 2.0
 
@@ -646,9 +687,13 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
         crop = _crop_from_center(cx, cy, target_w, target_h, w, h)
         crop_gray = _crop_region_gray(gray, crop)
         quality = _region_quality(crop_gray)
+        balloon_risk = _balloon_risk(crop_gray)
 
-        face_area_ratio = float(fw * fh) / float(max(1, w * h))
         conf = _clamp(0.30 + 1.7 * math.sqrt(max(0.0, face_area_ratio)) + 0.20 * quality, 0.0, 1.0)
+        conf = conf * (1.0 - 0.65 * balloon_risk)
+        if balloon_risk > 0.55:
+            conf = conf * 0.35
+        conf = _clamp(conf, 0.0, 1.0)
         return crop, conf
     except Exception:
         return None, 0.0
@@ -759,6 +804,40 @@ def _build_result(
     }
 
 
+def _select_best_mode(
+    sal_crop: Tuple[int, int, int, int],
+    sal_conf: float,
+    face_crop: Optional[Tuple[int, int, int, int]],
+    face_conf: float,
+    gray_analysis: np.ndarray,
+) -> Tuple[str, float, Tuple[int, int, int, int]]:
+    sal_gray = _crop_region_gray(gray_analysis, sal_crop)
+    sal_balloon_risk = _balloon_risk(sal_gray)
+    sal_effective_conf = _clamp(sal_conf - 0.40 * sal_balloon_risk, 0.0, 1.0)
+
+    face_effective_conf = 0.0
+    if face_crop is not None:
+        face_gray = _crop_region_gray(gray_analysis, face_crop)
+        face_quality = _region_quality(face_gray)
+        face_balloon_risk = _balloon_risk(face_gray)
+        face_effective_conf = _clamp(0.85 * face_conf + 0.15 * face_quality - 0.25 * face_balloon_risk, 0.0, 1.0)
+
+    use_face = False
+    if face_crop is not None:
+        if sal_balloon_risk >= BALLOON_RISK_OVERRIDE_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
+            use_face = True
+        elif face_effective_conf >= FACE_ACCEPT_THRESHOLD and face_effective_conf >= sal_effective_conf:
+            use_face = True
+        elif sal_effective_conf < SALIENCY_ACCEPT_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
+            use_face = True
+
+    if use_face and face_crop is not None:
+        return "face", face_effective_conf, face_crop
+    if sal_effective_conf >= SALIENCY_ACCEPT_THRESHOLD:
+        return "saliency", sal_effective_conf, sal_crop
+    return "fallback", 0.0, sal_crop
+
+
 def main() -> None:
     payload = {}
     try:
@@ -795,37 +874,31 @@ def main() -> None:
         sal_crop, sal_conf = _saliency_crop(analysis, ratio)
         mapped_sal_crop = _map_crop_to_original(sal_crop, aw, ah, orig_w, orig_h, ratio)
         mapped_sal_crop = _ensure_in_bounds(*mapped_sal_crop, orig_w, orig_h, ratio)
-        sal_gray = _crop_region_gray(gray_analysis, sal_crop)
-        sal_balloon_risk = _balloon_risk(sal_gray)
-        sal_effective_conf = _clamp(sal_conf - 0.35 * sal_balloon_risk, 0.0, 1.0)
 
         face_crop, face_conf = _face_crop(analysis, ratio)
         mapped_face_crop = None
-        face_effective_conf = 0.0
         if face_crop is not None:
             mapped_face_crop = _map_crop_to_original(face_crop, aw, ah, orig_w, orig_h, ratio)
             mapped_face_crop = _ensure_in_bounds(*mapped_face_crop, orig_w, orig_h, ratio)
-            face_gray = _crop_region_gray(gray_analysis, face_crop)
-            face_quality = _region_quality(face_gray)
-            face_effective_conf = _clamp(0.85 * face_conf + 0.15 * face_quality, 0.0, 1.0)
 
-        use_face = False
-        if mapped_face_crop is not None:
-            if sal_balloon_risk >= BALLOON_RISK_OVERRIDE_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
-                use_face = True
-            elif face_effective_conf >= FACE_ACCEPT_THRESHOLD and face_effective_conf >= sal_effective_conf - 0.03:
-                use_face = True
-            elif sal_effective_conf < SALIENCY_ACCEPT_THRESHOLD and face_effective_conf >= FACE_OVERRIDE_THRESHOLD:
-                use_face = True
-
-        if use_face and mapped_face_crop is not None:
+        mode, effective_conf, mode_crop = _select_best_mode(
+            sal_crop=sal_crop,
+            sal_conf=sal_conf,
+            face_crop=face_crop,
+            face_conf=face_conf,
+            gray_analysis=gray_analysis,
+        )
+        if mode == "face" and mapped_face_crop is not None:
             crop = mapped_face_crop
             method = "face"
-            confidence = face_effective_conf
-        elif sal_effective_conf >= SALIENCY_ACCEPT_THRESHOLD:
+            confidence = effective_conf
+        elif mode == "saliency":
             crop = mapped_sal_crop
             method = "saliency"
-            confidence = sal_effective_conf
+            confidence = effective_conf
+        elif mode == "fallback":
+            # keep deterministic fallback selected earlier
+            _ = mode_crop
 
     crop = _ensure_in_bounds(*crop, orig_w, orig_h, ratio)
     result = _build_result(crop[0], crop[1], crop[2], crop[3], method, confidence)

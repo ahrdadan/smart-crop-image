@@ -100,7 +100,8 @@ Contoh payload (chapter banyak halaman):
   "apply_crop": true,
   "output_path": "D:/data/ch001/ch001-thumb.jpg",
   "quality": 85,
-  "return_candidates": true
+  "return_candidates": true,
+  "compose_mode": "pair"
 }
 ```
 
@@ -145,6 +146,8 @@ Contoh response (chapter mode):
 
 Jika crop file gagal (mis. `vips` belum terpasang), API tetap mengembalikan koordinat + field `crop_error`.
 
+Untuk chapter portrait panjang, `compose_mode: "pair"` akan mencoba menggabungkan 2 halaman kandidat terbaik secara horizontal menjadi output 16:9.
+
 ## Test Dengan Folder `/sample`
 
 Test sample sekarang otomatis dijalankan oleh:
@@ -158,6 +161,12 @@ Kalau ingin start API tanpa test sample:
 
 ```bash
 RUN_SAMPLE_TEST=0 ./scripts/start_background.sh
+```
+
+Untuk test sample mode gabung 2 halaman:
+
+```bash
+SAMPLE_COMPOSE_MODE=pair ./scripts/start_background.sh
 ```
 
 Output yang dihasilkan:
@@ -174,6 +183,8 @@ Output yang dihasilkan:
   `1` (default) untuk auto-test sample, `0` untuk skip test.
 - `SAMPLE_APPLY_CROP`  
   `1` (default) untuk test dengan crop fisik jika `vips` tersedia, `0` untuk test koordinat saja.
+- `SAMPLE_COMPOSE_MODE`  
+  `single` (default) atau `pair` untuk mode test sample.
 - `AUTO_PORT_FALLBACK`  
   `1` (default) jika port dipakai proses lain maka otomatis pindah ke port kosong berikutnya.
 - `LOG_FILE`  
@@ -192,6 +203,8 @@ Output yang dihasilkan:
   Untuk mode chapter. API akan evaluasi tiap halaman, lalu pilih halaman terbaik secara deterministik.
 - `return_candidates` (di body request)  
   Jika `true`, response menyertakan daftar skor tiap halaman (`candidates`).
+- `compose_mode` (di body request)  
+  `single` (default) atau `pair`. Mode `pair` menggabungkan 2 halaman terbaik (side-by-side) untuk thumbnail 16:9.
 
 ## Dependency Runtime
 

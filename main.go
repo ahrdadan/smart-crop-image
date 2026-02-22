@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ type ThumbnailRequest struct {
 	OutputPath       string      `json:"output_path"`
 	Quality          int         `json:"quality"`
 	ReturnCandidates bool        `json:"return_candidates"`
+	ComposeMode      string      `json:"compose_mode"`
 }
 
 type CropResult struct {
@@ -53,6 +55,8 @@ type ThumbnailResponse struct {
 	OutputPath        string               `json:"output_path,omitempty"`
 	WorkerWarning     string               `json:"worker_warning,omitempty"`
 	CropError         string               `json:"crop_error,omitempty"`
+	CompositionMode   string               `json:"composition_mode,omitempty"`
+	ComposedFrom      []string             `json:"composed_from,omitempty"`
 	SelectedPageIndex *int                 `json:"selected_page_index,omitempty"`
 	SelectedImagePath string               `json:"selected_image_path,omitempty"`
 	SelectedScore     float64              `json:"selected_score,omitempty"`
@@ -117,8 +121,9 @@ func thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp := ThumbnailResponse{Applied: false}
 	sourceImagePath := strings.TrimSpace(req.ImagePath)
+	chapterMode := len(cleanImagePaths(req.ImagePaths)) > 0
 
-	if len(cleanImagePaths(req.ImagePaths)) > 0 {
+	if chapterMode {
 		resp = generateChapterThumbnail(r.Context(), req)
 		sourceImagePath = resp.SelectedImagePath
 	} else {
@@ -131,12 +136,30 @@ func thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 
 	if shouldApplyCrop(req) {
 		outputPath := resolveOutputPath(sourceImagePath, req.OutputPath)
-		if err := applyCropWithVips(r.Context(), sourceImagePath, outputPath, resp.CropResult, req.Quality); err != nil {
-			resp.CropError = err.Error()
+		if shouldComposePair(req) && chapterMode {
+			if err := applyPairComposeWithVips(r.Context(), req, &resp, outputPath); err != nil {
+				resp.CropError = "pair compose failed: " + err.Error()
+				// Fallback to single-image crop for robustness.
+				if err2 := applyCropWithVips(r.Context(), sourceImagePath, outputPath, resp.CropResult, req.Quality); err2 != nil {
+					resp.CropError = resp.CropError + " | single fallback failed: " + err2.Error()
+				} else {
+					resp.Applied = true
+					resp.OutputPath = outputPath
+					resp.CompositionMode = "single-fallback"
+				}
+			}
 		} else {
-			resp.Applied = true
-			resp.OutputPath = outputPath
+			if err := applyCropWithVips(r.Context(), sourceImagePath, outputPath, resp.CropResult, req.Quality); err != nil {
+				resp.CropError = err.Error()
+			} else {
+				resp.Applied = true
+				resp.OutputPath = outputPath
+				resp.CompositionMode = "single"
+			}
 		}
+	}
+	if !req.ReturnCandidates && !shouldComposePair(req) {
+		resp.Candidates = nil
 	}
 
 	respondJSON(w, http.StatusOK, resp)
@@ -209,9 +232,7 @@ func generateChapterThumbnail(ctx context.Context, req ThumbnailRequest) Thumbna
 		resp.SelectedPageIndex = &selectedIndex
 	}
 
-	if req.ReturnCandidates {
-		resp.Candidates = candidates
-	}
+	resp.Candidates = candidates
 	if len(warnings) > 0 {
 		resp.WorkerWarning = strings.Join(warnings, " | ")
 	}
@@ -306,6 +327,11 @@ func shouldApplyCrop(req ThumbnailRequest) bool {
 	return strings.TrimSpace(req.OutputPath) != ""
 }
 
+func shouldComposePair(req ThumbnailRequest) bool {
+	mode := strings.ToLower(strings.TrimSpace(req.ComposeMode))
+	return mode == "pair" || mode == "dual" || mode == "2up"
+}
+
 func resolveOutputPath(inputPath, outputPath string) string {
 	if strings.TrimSpace(outputPath) != "" {
 		return outputPath
@@ -332,10 +358,7 @@ func applyCropWithVips(ctx context.Context, inputPath, outputPath string, crop C
 		return fmt.Errorf("image not found: %s", inputPath)
 	}
 
-	if quality <= 0 {
-		quality = 85
-	}
-	quality = minInt(maxInt(quality, 1), 100)
+	quality = normalizeQuality(quality)
 
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return fmt.Errorf("create output directory failed: %w", err)
@@ -346,6 +369,158 @@ func applyCropWithVips(ctx context.Context, inputPath, outputPath string, crop C
 		return errors.New("libvips CLI not found (install `vips` and ensure it is in PATH)")
 	}
 
+	if err := runVipsCropRaw(ctx, vipsBinary, inputPath, outputPath, crop, quality); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyPairComposeWithVips(ctx context.Context, req ThumbnailRequest, resp *ThumbnailResponse, outputPath string) error {
+	if resp == nil {
+		return errors.New("empty response object")
+	}
+	leftCand, rightCand, ok := topTwoCandidates(resp.Candidates)
+	if !ok {
+		return errors.New("not enough candidates for pair composition")
+	}
+
+	leftCrop, leftWarn := generateCropForImageRatio(ctx, req, leftCand.ImagePath, "8:9")
+	rightCrop, rightWarn := generateCropForImageRatio(ctx, req, rightCand.ImagePath, "8:9")
+	if leftWarn != nil || rightWarn != nil {
+		warnings := make([]string, 0, 2)
+		if leftWarn != nil {
+			warnings = append(warnings, "left:"+leftWarn.Error())
+		}
+		if rightWarn != nil {
+			warnings = append(warnings, "right:"+rightWarn.Error())
+		}
+		if len(warnings) > 0 {
+			if strings.TrimSpace(resp.WorkerWarning) == "" {
+				resp.WorkerWarning = strings.Join(warnings, " | ")
+			} else {
+				resp.WorkerWarning = resp.WorkerWarning + " | " + strings.Join(warnings, " | ")
+			}
+		}
+	}
+
+	leftW, leftH := resolveDimensions(ThumbnailRequest{ImagePath: leftCand.ImagePath})
+	rightW, rightH := resolveDimensions(ThumbnailRequest{ImagePath: rightCand.ImagePath})
+	if leftW <= 0 || leftH <= 0 || rightW <= 0 || rightH <= 0 {
+		return errors.New("cannot resolve dimensions for pair compose source images")
+	}
+
+	panelH := minInt(leftCrop.CropHeight, rightCrop.CropHeight)
+	if panelH <= 0 {
+		panelH = minInt(leftH, rightH)
+	}
+	panelW := int(math.Round(float64(panelH) * (8.0 / 9.0)))
+	if panelW <= 0 || panelH <= 0 {
+		return errors.New("invalid panel size for pair compose")
+	}
+
+	leftNorm := retargetCropToSize(leftCrop, panelW, panelH, leftW, leftH)
+	rightNorm := retargetCropToSize(rightCrop, panelW, panelH, rightW, rightH)
+
+	vipsBinary, err := exec.LookPath("vips")
+	if err != nil {
+		return errors.New("libvips CLI not found (install `vips` and ensure it is in PATH)")
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		return fmt.Errorf("create output directory failed: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "thumb_pair_*")
+	if err != nil {
+		return fmt.Errorf("cannot create temp dir for pair compose: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	leftTmp := filepath.Join(tmpDir, "left.png")
+	rightTmp := filepath.Join(tmpDir, "right.png")
+	quality := normalizeQuality(req.Quality)
+
+	if err := runVipsCropRaw(ctx, vipsBinary, leftCand.ImagePath, leftTmp, leftNorm, quality); err != nil {
+		return fmt.Errorf("left crop failed: %w", err)
+	}
+	if err := runVipsCropRaw(ctx, vipsBinary, rightCand.ImagePath, rightTmp, rightNorm, quality); err != nil {
+		return fmt.Errorf("right crop failed: %w", err)
+	}
+
+	outputSpec := buildVipsOutputSpec(outputPath, quality)
+	joinArgs := []string{"join", leftTmp, rightTmp, outputSpec, "horizontal"}
+	if err := runVipsCommand(ctx, vipsBinary, joinArgs); err != nil {
+		fallbackArgs := []string{"arrayjoin", leftTmp, rightTmp, outputSpec, "--across", "2"}
+		if err2 := runVipsCommand(ctx, vipsBinary, fallbackArgs); err2 != nil {
+			return fmt.Errorf("vips join failed: %v; fallback arrayjoin failed: %v", err, err2)
+		}
+	}
+
+	resp.Applied = true
+	resp.OutputPath = outputPath
+	resp.CompositionMode = "pair"
+	resp.ComposedFrom = []string{leftCand.ImagePath, rightCand.ImagePath}
+	return nil
+}
+
+func topTwoCandidates(candidates []ThumbnailCandidate) (ThumbnailCandidate, ThumbnailCandidate, bool) {
+	if len(candidates) < 2 {
+		return ThumbnailCandidate{}, ThumbnailCandidate{}, false
+	}
+	copied := make([]ThumbnailCandidate, 0, len(candidates))
+	copied = append(copied, candidates...)
+	sort.SliceStable(copied, func(i, j int) bool {
+		if math.Abs(copied[i].Score-copied[j].Score) <= 1e-9 {
+			return copied[i].PageIndex < copied[j].PageIndex
+		}
+		return copied[i].Score > copied[j].Score
+	})
+	return copied[0], copied[1], true
+}
+
+func generateCropForImageRatio(ctx context.Context, req ThumbnailRequest, imagePath string, ratio string) (CropResult, error) {
+	pageReq := req
+	pageReq.ImagePath = imagePath
+	pageReq.ImagePaths = nil
+	pageReq.ImageWidth = 0
+	pageReq.ImageHeight = 0
+	pageReq.PreferredRatio = ratio
+	pageReq.ApplyCrop = false
+	pageReq.OutputPath = ""
+	return GenerateThumbnailCrop(ctx, pageReq)
+}
+
+func retargetCropToSize(crop CropResult, targetW, targetH, imageW, imageH int) CropResult {
+	targetW = maxInt(1, targetW)
+	targetH = maxInt(1, targetH)
+	cx := crop.CropX + crop.CropWidth/2
+	cy := crop.CropY + crop.CropHeight/2
+	x := cx - targetW/2
+	y := cy - targetH/2
+	ratio := float64(targetW) / float64(targetH)
+	return ensureInBounds(x, y, targetW, targetH, imageW, imageH, ratio)
+}
+
+func normalizeQuality(quality int) int {
+	if quality <= 0 {
+		quality = 85
+	}
+	return minInt(maxInt(quality, 1), 100)
+}
+
+func runVipsCommand(ctx context.Context, vipsBinary string, args []string) error {
+	cmd := exec.CommandContext(ctx, vipsBinary, args...)
+	out, cmdErr := cmd.CombinedOutput()
+	if cmdErr != nil {
+		stderr := strings.TrimSpace(string(out))
+		if stderr != "" {
+			return fmt.Errorf("%v (%s)", cmdErr, stderr)
+		}
+		return cmdErr
+	}
+	return nil
+}
+
+func runVipsCropRaw(ctx context.Context, vipsBinary, inputPath, outputPath string, crop CropResult, quality int) error {
 	outputSpec := buildVipsOutputSpec(outputPath, quality)
 	args := []string{
 		"crop",
@@ -356,15 +531,8 @@ func applyCropWithVips(ctx context.Context, inputPath, outputPath string, crop C
 		strconv.Itoa(crop.CropWidth),
 		strconv.Itoa(crop.CropHeight),
 	}
-
-	cmd := exec.CommandContext(ctx, vipsBinary, args...)
-	out, cmdErr := cmd.CombinedOutput()
-	if cmdErr != nil {
-		stderr := strings.TrimSpace(string(out))
-		if stderr != "" {
-			return fmt.Errorf("vips crop failed: %v (%s)", cmdErr, stderr)
-		}
-		return fmt.Errorf("vips crop failed: %v", cmdErr)
+	if err := runVipsCommand(ctx, vipsBinary, args); err != nil {
+		return fmt.Errorf("vips crop failed: %w", err)
 	}
 	return nil
 }
