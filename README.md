@@ -57,8 +57,10 @@ Atau pakai script background (install dependency + build + start):
 `start_background.sh` akan:
 - deteksi OS + arsitektur
 - auto-install dependency yang belum ada (`python3`, `go`, `curl`, dan mencoba `vips`)
-- menyimpan log proses ke `logs/start_background_*.log`
-- menyimpan log server ke `logs/server.log`
+- membuat/repair virtualenv (dengan fallback jika `python3 -m venv` error)
+- menjalankan API di background (`nohup`)
+- otomatis test endpoint `/thumbnail` menggunakan semua gambar di folder `sample/`
+- menyimpan semua output (setup + server + test) ke **satu file log**: `logs/start_background_*.log`
 
 ## Request API
 
@@ -145,24 +147,35 @@ Jika crop file gagal (mis. `vips` belum terpasang), API tetap mengembalikan koor
 
 ## Test Dengan Folder `/sample`
 
-Script test chapter dari semua image di folder `sample`:
+Test sample sekarang otomatis dijalankan oleh:
 
 ```bash
-./scripts/test_sample_thumbnail.sh
+./scripts/start_background.sh
 ```
 
-Taruh file gambar chapter (jpg/png/webp) di folder `sample/` sebelum menjalankan script.
+Taruh file gambar chapter (jpg/png/webp) di folder `sample/` sebelum menjalankan script.  
+Kalau ingin start API tanpa test sample:
+
+```bash
+RUN_SAMPLE_TEST=0 ./scripts/start_background.sh
+```
 
 Output yang dihasilkan:
 - response JSON di `sample/out/thumbnail_response.json`
 - payload yang dipakai di `sample/out/thumbnail_payload.json`
 - thumbnail hasil crop di `sample/out/chapter-thumbnail.jpg`
-- log test di `logs/test_sample_thumbnail_*.log`
+- satu file log terpadu di `logs/start_background_*.log`
 
 ## Environment Variables
 
 - `PORT`  
   Port API Go. Default `8080`.
+- `RUN_SAMPLE_TEST`  
+  `1` (default) untuk auto-test sample, `0` untuk skip test.
+- `SAMPLE_APPLY_CROP`  
+  `1` (default) untuk test dengan crop fisik jika `vips` tersedia, `0` untuk test koordinat saja.
+- `LOG_FILE`  
+  Path log gabungan. Default `logs/start_background_<timestamp>.log`.
 - `THUMBNAIL_WORKER_PATH`  
   Path ke file worker Python. Default `thumbnail_worker.py`.
 - `PYTHON_BIN`  
