@@ -17,7 +17,7 @@ Urutan sesuai requirement:
 
 1. Preprocess: load image, resize max-side 512 (analysis only), grayscale untuk analisis.
 2. Saliency (primary): SpectralResidual/OpenCV, top 30% saliency, expand ke 16:9, score confidence.
-3. Face detection (secondary): dipakai jika confidence saliency rendah.
+3. Face detection (secondary): dipakai jika confidence saliency rendah. Prioritas model ONNX (`onnxruntime`, CPU) lalu fallback ke cascade.
 4. Fallback deterministic (mandatory): top-biased crop (~18%), full width jika memungkinkan.
 5. Output JSON wajib (tidak pernah `null`, tidak di luar bounds).
 
@@ -184,6 +184,8 @@ Output yang dihasilkan:
   Command Python custom, contoh: `python` atau `py -3`.
 - `ANIME_FACE_CASCADE_PATH`  
   Path cascade XML anime face (opsional, dibaca oleh worker Python).
+- `ANIME_FACE_ONNX_PATH`  
+  Path model ONNX face/anime-face detector (opsional, prioritas utama untuk AI-assisted detection).
 - `apply_crop` / `output_path` / `quality` (di body request)  
   Mengaktifkan crop fisik dengan `vips crop`. Jika `output_path` kosong dan `apply_crop=true`, nama default: `<nama_file>_thumb.<ext>`.
 - `image_paths` (di body request)  

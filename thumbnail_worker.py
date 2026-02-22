@@ -4,7 +4,7 @@ import json
 import math
 import os
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -18,11 +18,17 @@ try:
 except Exception:
     Image = None
 
+try:
+    import onnxruntime as ort  # type: ignore
+except Exception:
+    ort = None
 
 DEFAULT_RATIO = 16.0 / 9.0
 DEFAULT_MAX_ANALYSIS_SIZE = 512
 SALIENCY_ACCEPT_THRESHOLD = 0.6
 FACE_ACCEPT_THRESHOLD = 0.5
+
+_ONNX_FACE_SESSION: Any = None
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -148,6 +154,75 @@ def _fallback_saliency_map(gray: np.ndarray) -> np.ndarray:
     return _normalize_map(mag)
 
 
+def _estimate_text_density(gray: np.ndarray) -> float:
+    if cv2 is None:
+        return 0.0
+    if gray.size == 0:
+        return 0.0
+
+    try:
+        binary_inv = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            15,
+            8,
+        )
+        num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(binary_inv, connectivity=8)
+        if num_labels <= 1:
+            return 0.0
+
+        h, w = gray.shape[:2]
+        total_area = float(max(1, h * w))
+        small_area = 0.0
+
+        for i in range(1, num_labels):
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < 4 or area > 120:
+                continue
+            if bw <= 0 or bh <= 0:
+                continue
+            aspect = float(bw) / float(max(1, bh))
+            if 0.2 <= aspect <= 6.0:
+                # Prefer small, text-like components near edges of bubbles.
+                cx = x + bw / 2.0
+                cy = y + bh / 2.0
+                edge_bias = abs(cx - w / 2.0) / max(1.0, w / 2.0) * 0.2 + abs(cy - h / 2.0) / max(1.0, h / 2.0) * 0.1
+                small_area += area * (1.0 + edge_bias)
+
+        density = small_area / total_area
+        return _clamp(density * 6.0, 0.0, 1.0)
+    except Exception:
+        return 0.0
+
+
+def _region_quality(gray: np.ndarray) -> float:
+    if gray.size == 0:
+        return 0.0
+
+    white_ratio = float(np.mean(gray >= 245))
+    contrast = float(np.std(gray))
+    low_contrast_penalty = _clamp(1.0 - contrast / 64.0, 0.0, 1.0)
+    text_density = _estimate_text_density(gray)
+
+    score = 1.0 - (0.55 * white_ratio + 0.25 * low_contrast_penalty + 0.30 * text_density)
+    return _clamp(score, 0.0, 1.0)
+
+
+def _crop_region_gray(gray: np.ndarray, crop: Tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = crop
+    x = max(0, min(x, gray.shape[1] - 1))
+    y = max(0, min(y, gray.shape[0] - 1))
+    w = max(1, min(w, gray.shape[1] - x))
+    h = max(1, min(h, gray.shape[0] - y))
+    return gray[y : y + h, x : x + w]
+
+
 def _fit_ratio_size(
     desired_w: float, desired_h: float, image_w: int, image_h: int, ratio: float
 ) -> Tuple[int, int]:
@@ -206,7 +281,7 @@ def _expand_bbox_to_ratio(
 
 
 def _score_saliency(
-    saliency: np.ndarray, mask: np.ndarray, bbox_w: int, bbox_h: int
+    saliency: np.ndarray, mask: np.ndarray, bbox_w: int, bbox_h: int, region_quality: float
 ) -> float:
     h, w = saliency.shape[:2]
     if h <= 0 or w <= 0:
@@ -223,8 +298,53 @@ def _score_saliency(
 
     spread = _clamp(float(np.std(saliency)) * 2.0, 0.0, 1.0)
 
-    score = 0.5 * separation + 0.3 * compactness + 0.2 * spread
+    score = 0.42 * separation + 0.23 * compactness + 0.15 * spread + 0.20 * _clamp(region_quality, 0.0, 1.0)
     return _clamp(score, 0.0, 1.0)
+
+
+def _best_saliency_bbox(mask: np.ndarray, saliency_map: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    if cv2 is None:
+        return None
+    if mask.size == 0 or not np.any(mask):
+        return None
+
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    kernel = np.ones((3, 3), np.uint8)
+    processed = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+    processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(processed, connectivity=8)
+    if num_labels <= 1:
+        ys, xs = np.where(mask)
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+        return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    best_idx = -1
+    best_score = -1.0
+    for i in range(1, num_labels):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area <= 0 or w <= 0 or h <= 0:
+            continue
+        component = labels[y : y + h, x : x + w] == i
+        mean_sal = float(np.mean(saliency_map[y : y + h, x : x + w][component]))
+        score = mean_sal * math.sqrt(float(area))
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx < 0:
+        return None
+
+    x = int(stats[best_idx, cv2.CC_STAT_LEFT])
+    y = int(stats[best_idx, cv2.CC_STAT_TOP])
+    w = int(stats[best_idx, cv2.CC_STAT_WIDTH])
+    h = int(stats[best_idx, cv2.CC_STAT_HEIGHT])
+    return (x, y, x + w - 1, y + h - 1)
 
 
 def _saliency_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Tuple[int, int, int, int], float]:
@@ -253,19 +373,168 @@ def _saliency_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Tuple[int, i
         if not np.any(mask):
             mask = saliency_map > 0
 
-        ys, xs = np.where(mask)
-        if len(xs) == 0 or len(ys) == 0:
+        bbox = _best_saliency_bbox(mask, saliency_map)
+        if bbox is None:
             crop_h = max(1, min(h, int(round(w / ratio))))
             return (0, 0, w, crop_h), 0.0
 
-        x0, x1 = int(xs.min()), int(xs.max())
-        y0, y1 = int(ys.min()), int(ys.max())
+        x0, y0, x1, y1 = bbox
         cx, cy, cw, ch = _expand_bbox_to_ratio(x0, y0, x1, y1, w, h, ratio)
-        conf = _score_saliency(saliency_map, mask, cw, ch)
+        gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
+        crop_gray = _crop_region_gray(gray, (cx, cy, cw, ch))
+        quality = _region_quality(crop_gray)
+        conf = _score_saliency(saliency_map, mask, cw, ch, quality)
         return (cx, cy, cw, ch), conf
     except Exception:
         crop_h = max(1, min(h, int(round(w / ratio))))
         return (0, 0, w, crop_h), 0.0
+
+
+def _get_onnx_face_session() -> Optional[Any]:
+    global _ONNX_FACE_SESSION
+    if _ONNX_FACE_SESSION is not None:
+        return _ONNX_FACE_SESSION
+    if ort is None:
+        return None
+
+    candidates = []
+    env_path = os.environ.get("ANIME_FACE_ONNX_PATH", "").strip()
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend(
+        [
+            os.path.join("models", "anime_face.onnx"),
+            os.path.join("models", "yolov5n-face.onnx"),
+            os.path.join("models", "face.onnx"),
+        ]
+    )
+
+    for path in candidates:
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue
+        try:
+            _ONNX_FACE_SESSION = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            return _ONNX_FACE_SESSION
+        except Exception:
+            continue
+    return None
+
+
+def _yolo_like_boxes_from_output(output: np.ndarray, input_w: int, input_h: int) -> List[Tuple[int, int, int, int, float]]:
+    boxes: List[Tuple[int, int, int, int, float]] = []
+    arr = output
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2 or arr.shape[1] < 5:
+        return boxes
+
+    # Case A: xyxy(+score...)
+    xyxy_like = float(np.mean((arr[:, 2] > arr[:, 0]) & (arr[:, 3] > arr[:, 1])))
+    if xyxy_like > 0.9:
+        for row in arr:
+            x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            score = float(row[4]) if arr.shape[1] >= 5 else 0.0
+            if arr.shape[1] >= 6:
+                cls_prob = float(np.max(row[5:]))
+                if cls_prob > 0.0:
+                    score = score * cls_prob
+            if score < 0.25:
+                continue
+            if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+                x1 *= input_w
+                x2 *= input_w
+                y1 *= input_h
+                y2 *= input_h
+            boxes.append((int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)), score))
+        return boxes
+
+    # Case B: cx,cy,w,h,obj,cls...
+    for row in arr:
+        cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+        obj = float(row[4])
+        cls_prob = float(np.max(row[5:])) if arr.shape[1] > 5 else 1.0
+        score = obj * cls_prob
+        if score < 0.25:
+            continue
+        if max(abs(cx), abs(cy), abs(bw), abs(bh)) <= 1.5:
+            cx *= input_w
+            bw *= input_w
+            cy *= input_h
+            bh *= input_h
+        x1 = cx - bw / 2.0
+        y1 = cy - bh / 2.0
+        x2 = cx + bw / 2.0
+        y2 = cy + bh / 2.0
+        boxes.append((int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)), score))
+    return boxes
+
+
+def _onnx_face_boxes(analysis_bgr: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+    session = _get_onnx_face_session()
+    if session is None:
+        return []
+    if cv2 is None:
+        return []
+
+    h, w = analysis_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return []
+
+    input_size = 640
+    resized = cv2.resize(analysis_bgr, (input_size, input_size), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    tensor = np.transpose(rgb, (2, 0, 1))[None, :, :, :]
+
+    try:
+        input_name = session.get_inputs()[0].name
+        outputs = session.run(None, {input_name: tensor})
+    except Exception:
+        return []
+
+    raw_boxes: List[Tuple[int, int, int, int, float]] = []
+    for out in outputs:
+        raw_boxes.extend(_yolo_like_boxes_from_output(np.asarray(out), input_size, input_size))
+    if not raw_boxes:
+        return []
+
+    nms_boxes = []
+    nms_scores = []
+    for x1, y1, x2, y2, score in raw_boxes:
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        nms_boxes.append([x1, y1, bw, bh])
+        nms_scores.append(float(score))
+
+    try:
+        indices = cv2.dnn.NMSBoxes(nms_boxes, nms_scores, score_threshold=0.25, nms_threshold=0.45)
+    except Exception:
+        indices = []
+
+    if indices is None or len(indices) == 0:
+        selected = list(range(len(raw_boxes)))
+    else:
+        selected = [int(i[0]) if isinstance(i, (list, tuple, np.ndarray)) else int(i) for i in indices]
+
+    sx = float(w) / float(input_size)
+    sy = float(h) / float(input_size)
+
+    final_boxes = []
+    for idx in selected:
+        x1, y1, x2, y2, score = raw_boxes[idx]
+        ax1 = int(round(x1 * sx))
+        ay1 = int(round(y1 * sy))
+        ax2 = int(round(x2 * sx))
+        ay2 = int(round(y2 * sy))
+        ax1 = max(0, min(ax1, w - 1))
+        ay1 = max(0, min(ay1, h - 1))
+        ax2 = max(0, min(ax2, w - 1))
+        ay2 = max(0, min(ay2, h - 1))
+        if ax2 <= ax1 or ay2 <= ay1:
+            continue
+        final_boxes.append((ax1, ay1, ax2, ay2, float(score)))
+    return final_boxes
 
 
 def _get_face_cascade() -> Optional[Any]:
@@ -305,12 +574,39 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
     if h <= 0 or w <= 0:
         return None, 0.0
 
+    gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
+
+    try:
+        onnx_faces = _onnx_face_boxes(analysis_bgr)
+        if len(onnx_faces) > 0:
+            onnx_faces = sorted(
+                onnx_faces,
+                key=lambda f: (f[4], (f[2] - f[0]) * (f[3] - f[1])),
+                reverse=True,
+            )
+            x1, y1, x2, y2, det_score = onnx_faces[0]
+            fw = max(1, x2 - x1)
+            fh = max(1, y2 - y1)
+            cx = x1 + fw / 2.0
+            cy = y1 + fh / 2.0
+            padded_w = fw * 2.8
+            padded_h = fh * 2.9
+            target_w, target_h = _fit_ratio_size(padded_w, padded_h, w, h, ratio)
+            crop = _crop_from_center(cx, cy, target_w, target_h, w, h)
+            crop_gray = _crop_region_gray(gray, crop)
+            quality = _region_quality(crop_gray)
+
+            face_area_ratio = float(fw * fh) / float(max(1, w * h))
+            conf = _clamp(0.50 * float(det_score) + 0.30 * quality + 0.20 * math.sqrt(max(0.0, face_area_ratio)), 0.0, 1.0)
+            return crop, conf
+    except Exception:
+        pass
+
     cascade = _get_face_cascade()
     if cascade is None:
         return None, 0.0
 
     try:
-        gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
         min_side = max(16, int(round(min(w, h) * 0.06)))
         faces = cascade.detectMultiScale(
             gray,
@@ -331,9 +627,11 @@ def _face_crop(analysis_bgr: np.ndarray, ratio: float) -> Tuple[Optional[Tuple[i
         padded_h = fh * 2.6
         target_w, target_h = _fit_ratio_size(padded_w, padded_h, w, h, ratio)
         crop = _crop_from_center(cx, cy, target_w, target_h, w, h)
+        crop_gray = _crop_region_gray(gray, crop)
+        quality = _region_quality(crop_gray)
 
         face_area_ratio = float(fw * fh) / float(max(1, w * h))
-        conf = _clamp(0.35 + 2.0 * math.sqrt(max(0.0, face_area_ratio)), 0.0, 1.0)
+        conf = _clamp(0.30 + 1.7 * math.sqrt(max(0.0, face_area_ratio)) + 0.20 * quality, 0.0, 1.0)
         return crop, conf
     except Exception:
         return None, 0.0
@@ -382,6 +680,38 @@ def _fallback_crop(orig_w: int, orig_h: int, ratio: float) -> Tuple[int, int, in
     x = max(0, (orig_w - target_w) // 2)
     y = 0
     return (x, y, target_w, target_h)
+
+
+def _fallback_crop_with_analysis(
+    analysis_bgr: np.ndarray, ratio: float
+) -> Tuple[int, int, int, int]:
+    h, w = analysis_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return (0, 0, max(1, w), max(1, h))
+
+    target_w = w
+    target_h = int(round(target_w / ratio))
+    if target_h > h:
+        return _fallback_crop(w, h, ratio)
+
+    gray = cv2.cvtColor(analysis_bgr, cv2.COLOR_BGR2GRAY)
+    best = None
+    best_quality = -1.0
+
+    for top_bias in (0.15, 0.18, 0.20):
+        y = int(round(h * top_bias))
+        if y + target_h > h:
+            y = max(0, h - target_h)
+        candidate = (0, y, target_w, target_h)
+        region = _crop_region_gray(gray, candidate)
+        quality = _region_quality(region)
+        if quality > best_quality:
+            best_quality = quality
+            best = candidate
+
+    if best is None:
+        return _fallback_crop(w, h, ratio)
+    return best
 
 
 def _ensure_in_bounds(
@@ -440,6 +770,9 @@ def main() -> None:
     if img is not None and cv2 is not None:
         analysis = _resize_for_analysis(img, max_analysis_size)
         ah, aw = analysis.shape[:2]
+        analysis_fallback = _fallback_crop_with_analysis(analysis, ratio)
+        crop = _map_crop_to_original(analysis_fallback, aw, ah, orig_w, orig_h, ratio)
+        crop = _ensure_in_bounds(*crop, orig_w, orig_h, ratio)
 
         sal_crop, sal_conf = _saliency_crop(analysis, ratio)
         mapped_sal_crop = _map_crop_to_original(sal_crop, aw, ah, orig_w, orig_h, ratio)

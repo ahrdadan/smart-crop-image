@@ -229,11 +229,12 @@ create_or_repair_venv() {
   fi
 
   echo "Creating virtualenv at $VENV_DIR"
-  if python3 -m venv "$VENV_DIR"; then
+  # Prefer virtualenv to avoid ensurepip failures on minimal/system Python builds.
+  if python3 -m pip install --upgrade pip virtualenv && python3 -m virtualenv "$VENV_DIR"; then
     return
   fi
 
-  echo "python3 -m venv failed. Trying package fix + fallback."
+  echo "virtualenv creation failed. Trying package fix + fallback."
   local manager
   manager="$(detect_pkg_manager)"
   case "$manager" in
@@ -250,13 +251,12 @@ create_or_repair_venv() {
       ;;
   esac
 
-  if python3 -m venv "$VENV_DIR"; then
+  if python3 -m pip install --upgrade pip virtualenv && python3 -m virtualenv "$VENV_DIR"; then
     return
   fi
 
-  python3 -m pip install --upgrade pip
-  python3 -m pip install virtualenv
-  python3 -m virtualenv "$VENV_DIR"
+  # Last resort: venv module (can emit ensurepip errors on some distros).
+  python3 -m venv "$VENV_DIR"
 }
 
 health_ok() {
@@ -404,6 +404,15 @@ echo "Using python: $(command -v python3)"
 echo "Using go: $(command -v go)"
 if command -v vips >/dev/null 2>&1; then
   echo "Using vips: $(command -v vips)"
+fi
+if [[ -n "${ANIME_FACE_ONNX_PATH:-}" ]]; then
+  if [[ -f "$ANIME_FACE_ONNX_PATH" ]]; then
+    echo "Using AI face model: $ANIME_FACE_ONNX_PATH"
+  else
+    echo "warning: ANIME_FACE_ONNX_PATH is set but file not found: $ANIME_FACE_ONNX_PATH"
+  fi
+else
+  echo "warning: ANIME_FACE_ONNX_PATH not set. Worker will use cascade fallback for face detection."
 fi
 
 create_or_repair_venv
