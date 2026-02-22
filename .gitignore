@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Runtime artifacts
+logs/
+run/
+tmp/
+*.log
+*.pid
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated sample outputs
+sample/out/
+sample/*.json
