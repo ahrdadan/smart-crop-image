@@ -1,3 +1,12 @@
+---
+title: Smart Thumb Crop
+emoji: 📊
+colorFrom: red
+colorTo: gray
+sdk: docker
+pinned: false
+---
+
 # Smart Crop Image (Async Queue + Job Endpoint)
 
 Service ini memakai arsitektur **Go API + Python worker** dengan flow async:

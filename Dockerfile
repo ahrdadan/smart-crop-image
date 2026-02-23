@@ -13,7 +13,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_ROOT_USER_ACTION=ignore \
-    PORT=8080 \
+    PORT=7860 \
     PYTHON_BIN=python3 \
     SMART_THUMB_WORKER_PATH=/app/smart_thumb.py \
     SMART_THUMB_FALLBACK_WORKER_PATH=/app/fallback_thumb.py \
@@ -41,6 +41,6 @@ COPY --from=builder /out/smart-crop-image /app/smart-crop-image
 
 RUN mkdir -p /data/input /data/output /data/jobs
 
-EXPOSE 8080
+EXPOSE 7860
 
 ENTRYPOINT ["/app/smart-crop-image"]
