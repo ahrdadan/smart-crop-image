@@ -27,3 +27,5 @@ Thumbs.db
 # Generated sample outputs
 sample/out/
 sample/*.json
+
+sample
