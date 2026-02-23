@@ -77,6 +77,7 @@ type ThumbnailCandidate struct {
 type ThumbnailResponse struct {
 	CropResult
 	Applied           bool                 `json:"applied"`
+	FallbackUsed      bool                 `json:"fallback_used,omitempty"`
 	OutputPath        string               `json:"output_path,omitempty"`
 	WorkerWarning     string               `json:"worker_warning,omitempty"`
 	CropError         string               `json:"crop_error,omitempty"`
@@ -98,9 +99,11 @@ type smartPairPicked struct {
 }
 
 type smartPairResult struct {
-	OutPath string            `json:"out_path"`
-	Size    []int             `json:"size"`
-	Picked  []smartPairPicked `json:"picked"`
+	OutPath        string            `json:"out_path"`
+	Size           []int             `json:"size"`
+	Picked         []smartPairPicked `json:"picked"`
+	FallbackUsed   bool              `json:"fallback_used,omitempty"`
+	FallbackReason string            `json:"fallback_reason,omitempty"`
 }
 
 type commandCandidate struct {
@@ -1123,6 +1126,77 @@ func runPythonSmartPair(ctx context.Context, imagePaths []string, outputPath str
 	}
 
 	if len(attempts) == 0 {
+		attempts = append(attempts, "no python candidate configured")
+	}
+
+	primaryErr := strings.Join(attempts, "; ")
+	fallbackResult, fallbackErr := runPythonFallbackPair(ctx, imagePaths, outputPath, primaryErr)
+	if fallbackErr == nil {
+		fallbackResult.FallbackUsed = true
+		if strings.TrimSpace(fallbackResult.FallbackReason) == "" {
+			fallbackResult.FallbackReason = primaryErr
+		}
+		return fallbackResult, nil
+	}
+	return smartPairResult{}, fmt.Errorf("primary worker failed: %s; fallback failed: %v", primaryErr, fallbackErr)
+}
+
+func runPythonFallbackPair(ctx context.Context, imagePaths []string, outputPath, primaryError string) (smartPairResult, error) {
+	workerPath := strings.TrimSpace(os.Getenv("SMART_THUMB_FALLBACK_WORKER_PATH"))
+	if workerPath == "" {
+		workerPath = "fallback_thumb.py"
+	}
+	if !filepath.IsAbs(workerPath) {
+		abs, err := filepath.Abs(workerPath)
+		if err == nil {
+			workerPath = abs
+		}
+	}
+	if _, err := os.Stat(workerPath); err != nil {
+		return smartPairResult{}, fmt.Errorf("fallback worker not found at %s", workerPath)
+	}
+
+	payload := map[string]interface{}{
+		"image_paths":      imagePaths,
+		"output_path":      outputPath,
+		"gap":              envInt("THUMBNAIL_PAIR_GAP", 5),
+		"width":            envInt("THUMBNAIL_PAIR_WIDTH", 1200),
+		"fallback_reason":  primaryError,
+		"fallback_trigger": "primary-worker-failed",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return smartPairResult{}, fmt.Errorf("marshal fallback request failed: %w", err)
+	}
+
+	var attempts []string
+	for _, cand := range pythonCandidates() {
+		args := make([]string, 0, len(cand.Args)+3)
+		args = append(args, cand.Args...)
+		args = append(args, workerPath, "--input-json", string(body))
+
+		cmd := exec.CommandContext(ctx, cand.Bin, args...)
+		outBytes, cmdErr := cmd.CombinedOutput()
+		output := strings.TrimSpace(string(outBytes))
+		if cmdErr != nil {
+			attempts = append(attempts, fmt.Sprintf("%s failed: %v", cand.Bin, cmdErr))
+			continue
+		}
+
+		result, parseErr := parseSmartPairOutput(output)
+		if parseErr != nil {
+			attempts = append(attempts, fmt.Sprintf("%s output parse failed: %v", cand.Bin, parseErr))
+			continue
+		}
+		if _, statErr := os.Stat(result.OutPath); statErr != nil {
+			attempts = append(attempts, fmt.Sprintf("%s output file missing: %v", cand.Bin, statErr))
+			continue
+		}
+		result.FallbackUsed = true
+		return result, nil
+	}
+
+	if len(attempts) == 0 {
 		return smartPairResult{}, errors.New("no python candidate configured")
 	}
 	return smartPairResult{}, errors.New(strings.Join(attempts, "; "))
@@ -1247,6 +1321,13 @@ func buildPairResponse(req ThumbnailRequest, pair smartPairResult, fallbackOutpu
 		Applied:         true,
 		OutputPath:      outPath,
 		CompositionMode: "pair-smart-thumb",
+	}
+	if pair.FallbackUsed {
+		resp.FallbackUsed = true
+		resp.WorkerWarning = "fallback-smart-thumb: lightweight portrait pair composer was used"
+		if strings.TrimSpace(pair.FallbackReason) != "" {
+			resp.WorkerWarning = resp.WorkerWarning + " (" + truncateText(pair.FallbackReason, 240) + ")"
+		}
 	}
 
 	candidates := make([]ThumbnailCandidate, 0, len(pair.Picked))

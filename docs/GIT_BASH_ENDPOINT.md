@@ -148,6 +148,10 @@ Status queue:
 - `failed`: gagal diproses.
 
 Di response status job, field `webhook` berisi progres delivery callback (attempt, delivered, last_error).
+Jika worker utama gagal lalu fallback dipakai, response akan menampilkan:
+
+- `result.fallback_used: true`
+- `result.worker_warning: "fallback-smart-thumb ..."`
 
 ## 7) Ambil Hasil Gambar (`GET /job/{id}/image`)
 
@@ -237,6 +241,11 @@ curl -sS -X POST "http://127.0.0.1:8080/thumbnail" \
 `webhook.delivered=false`
 
 - Callback belum terkirim atau gagal; cek field `webhook.last_error` dari endpoint `GET /job/{id}`.
+
+`signal: killed` pada `crop_error` atau `error`
+
+- Biasanya proses utama kena OOM/limit resource.
+- Service akan mencoba fallback otomatis. Cek `result.fallback_used` di `GET /job/{id}` untuk memastikan fallback aktif.
 
 `image_paths, image_path, or image_files is required`
 

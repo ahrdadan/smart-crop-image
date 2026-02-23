@@ -30,6 +30,7 @@ Service ini memakai arsitektur **Go API + Python worker** dengan flow async:
 - Output path ditentukan server per job, bukan dari client.
 - Callback webhook async dengan retry.
 - Dukungan `image_files` Base64 untuk kirim file dari client ke server deploy.
+- Auto fallback worker ringan saat worker utama gagal (contoh: `signal: killed` / OOM).
 
 ## Docker Quick Start
 
@@ -102,6 +103,7 @@ node submit_thumbnail_job.mjs \
 - `PORT` (default `8080`)
 - `PYTHON_BIN` (default auto detect: `python`, `python3`, `py -3`)
 - `SMART_THUMB_WORKER_PATH` (default `smart_thumb.py`)
+- `SMART_THUMB_FALLBACK_WORKER_PATH` (default `fallback_thumb.py`)
 - `IMAGE_CONVERT_WORKER_PATH` (default `image_convert.py`)
 - `JOB_STORAGE_DIR` (default `job-data`)
 - `JOB_QUEUE_CAPACITY` (default `1000`)
@@ -146,3 +148,16 @@ Contoh field payload callback:
 - `event`: `thumbnail.job.completed`
 - `status`: `done` atau `failed`
 - `result.output_path`: URL endpoint image (bukan path file internal)
+
+## Fallback Behavior
+
+Jika worker utama gagal, server otomatis mencoba fallback composer ringan yang tetap menghasilkan:
+
+- 2 panel portrait
+- output 16:9
+- gap default `5` (mengikuti `THUMBNAIL_PAIR_GAP`)
+
+Penanda fallback di response job (`GET /job/{id}`):
+
+- `result.fallback_used = true`
+- `result.worker_warning` berisi alasan fallback

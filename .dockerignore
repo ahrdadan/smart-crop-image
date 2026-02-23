@@ -7,5 +7,6 @@ logs
 sample/out
 docker-data
 job-data
+sample/image-test/
 smart-crop-image.exe
 *.log

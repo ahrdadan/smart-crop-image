@@ -16,6 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     PYTHON_BIN=python3 \
     SMART_THUMB_WORKER_PATH=/app/smart_thumb.py \
+    SMART_THUMB_FALLBACK_WORKER_PATH=/app/fallback_thumb.py \
     IMAGE_CONVERT_WORKER_PATH=/app/image_convert.py \
     JOB_STORAGE_DIR=/data/jobs \
     JOB_TTL_HOURS=2 \
@@ -34,6 +35,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY smart_thumb.py ./
+COPY fallback_thumb.py ./
 COPY image_convert.py ./
 COPY --from=builder /out/smart-crop-image /app/smart-crop-image
 
