@@ -1,0 +1,10 @@
+{
+  "image_paths": [
+    "sample/01.webp",
+    "sample/02.webp",
+    "sample/03.webp",
+    "sample/04.webp"
+  ],
+  "return_candidates": true,
+  "webhook_url": "https://webhook.site/your-id"
+}

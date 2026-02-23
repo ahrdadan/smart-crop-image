@@ -1,0 +1,9 @@
+{
+  "image_paths": [
+    "/data/input/01.webp",
+    "/data/input/02.webp",
+    "/data/input/03.webp",
+    "/data/input/04.webp"
+  ],
+  "return_candidates": true
+}

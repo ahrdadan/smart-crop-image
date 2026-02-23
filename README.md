@@ -1,136 +1,82 @@
-# Smart Crop Image (Single Endpoint + Python Pair Composer)
+# Smart Crop Image (Async Queue + Job Endpoint)
 
-Project ini memakai arsitektur **Go API + Python worker** dengan **satu endpoint** saja:
+Service ini memakai arsitektur **Go API + Python worker** dengan flow async:
 
-- `POST /thumbnail`
+1. Client kirim `POST /thumbnail`.
+2. Server menaruh request ke queue.
+3. Client polling `GET /job/{id}`.
+4. Saat selesai, hasil gambar diakses lewat `GET /job/{id}/image`.
 
-Endpoint tersebut akan:
-- memilih 2 halaman terbaik dari input chapter,
-- menggabungkannya menjadi thumbnail 16:9 di Python (`smart_thumb.py`),
-- mengembalikan metadata hasilnya.
+## Endpoint
 
-## Struktur
+- `POST /thumbnail`  
+  Submit job baru (async queue).
+- `GET /job/{id}`  
+  Cek status queue/progress/result.
+- `GET /job/{id}/image?format=jpg|avif&width=...&quality=...`  
+  Ambil hasil gambar dengan opsi konversi.
+- `webhook_url` (opsional di payload `POST /thumbnail`)  
+  Jika diisi, server akan POST callback saat job selesai (`done` atau `failed`).
 
-- `main.go`  
-  API Go single endpoint (`/thumbnail`) yang memanggil `smart_thumb.py`.
-- `smart_thumb.py`  
-  Worker Python untuk ranking halaman + merge 2 gambar jadi 16:9.
-- `scripts/start_background.sh`  
-  Script setup dependency, build, start background, dan sample test.
+## Fitur Utama
 
-## Jalur Proses
+- Single worker processing (job diproses berurutan).
+- Queue position di response.
+- TTL job artifact: payload + output gambar dihapus otomatis setelah **2 jam** (default).
+- Output path ditentukan server per job, bukan dari client.
+- Callback webhook async dengan retry.
 
-1. Client kirim request ke `POST /thumbnail`.
-2. Go menyiapkan payload worker (`image_paths`, `output_path`, parameter pair).
-3. Go memanggil `smart_thumb.py`.
-4. Python memilih 2 gambar terbaik dan menghasilkan file output merge 16:9.
-5. Go mengembalikan response JSON.
-
-## Menjalankan API
-
-```bash
-go run .
-```
-
-Server listen default di `:8080`.
-
-Atau pakai script:
+## Docker Quick Start
 
 ```bash
-./scripts/start_background.sh
+docker build -t smart-crop-image:latest .
 ```
-
-## Request API
-
-Endpoint:
-
-```http
-POST /thumbnail
-Content-Type: application/json
-```
-
-Contoh payload chapter:
-
-```json
-{
-  "image_paths": [
-    "D:/data/ch001/page-001.jpg",
-    "D:/data/ch001/page-002.jpg",
-    "D:/data/ch001/page-003.jpg"
-  ],
-  "output_path": "D:/data/ch001/ch001-thumb.jpg",
-  "return_candidates": true
-}
-```
-
-Payload juga bisa pakai `image_path` tunggal.  
-Jika hanya 1 gambar valid, worker akan duplikasi panel agar tetap jadi 16:9 pair output.
-
-## Response Contoh
-
-```json
-{
-  "crop_x": 0,
-  "crop_y": 0,
-  "crop_width": 1200,
-  "crop_height": 675,
-  "method": "pair-smart-thumb",
-  "confidence": 1,
-  "applied": true,
-  "output_path": "D:/data/ch001/ch001-thumb.jpg",
-  "composition_mode": "pair-smart-thumb",
-  "composed_from": [
-    "D:/data/ch001/page-003.jpg",
-    "D:/data/ch001/page-007.jpg"
-  ],
-  "selected_page_index": 2,
-  "selected_image_path": "D:/data/ch001/page-003.jpg",
-  "selected_score": 1.9821
-}
-```
-
-Jika worker gagal, API tetap merespons dengan `crop_error`.
-
-## Sample Test
-
-Jalankan:
 
 ```bash
-SAMPLE_COMPOSE_MODE=pair ./scripts/start_background.sh
+MSYS_NO_PATHCONV=1 docker run --rm -d \
+  --name smart-crop-api \
+  -p 8080:8080 \
+  -e PORT=8080 \
+  -v "$(pwd)/docker-data/input:/data/input" \
+  -v "$(pwd)/docker-data/output:/data/output" \
+  -v "$(pwd)/docker-data/jobs:/data/jobs" \
+  smart-crop-image:latest
 ```
 
-Output sample:
-- `sample/out/thumbnail_response.json`
-- `sample/out/thumbnail_payload.json`
-- `sample/out/chapter-thumbnail.jpg`
-- `logs/start_background_*.log`
+Panduan Git Bash lengkap:
+
+- `docs/GIT_BASH_ENDPOINT.md`
+
+Sample client Node.js:
+
+- `sample/nodejs/submit_thumbnail_job.mjs`
 
 ## Environment Variables
 
-- `PORT`  
-  Port API Go. Default `8080`.
-- `PYTHON_BIN`  
-  Command Python custom, contoh: `python` atau `py -3`.
-- `SMART_THUMB_WORKER_PATH`  
-  Path worker pair Python. Default `smart_thumb.py`.
-- `THUMBNAIL_YOLO_MODEL`  
-  Model YOLO untuk worker pair. Default di worker: `yoloe-26s-seg.pt`.
-- `THUMBNAIL_YOLO_DEVICE`  
-  Device inference. Default `cpu`.
-- `THUMBNAIL_PAIR_SKIP_EDGES`  
-  Parameter `skip_edges`. Default `2`.
-- `THUMBNAIL_PAIR_GAP`  
-  Jarak antar panel. Default `5`.
-- `THUMBNAIL_PAIR_WIDTH`  
-  Lebar output. Default `1200`.
+- `PORT` (default `8080`)
+- `PYTHON_BIN` (default auto detect: `python`, `python3`, `py -3`)
+- `SMART_THUMB_WORKER_PATH` (default `smart_thumb.py`)
+- `IMAGE_CONVERT_WORKER_PATH` (default `image_convert.py`)
+- `JOB_STORAGE_DIR` (default `job-data`)
+- `JOB_QUEUE_CAPACITY` (default `1000`)
+- `JOB_TTL_HOURS` (default `2`)
+- `JOB_PROCESS_TIMEOUT_SECONDS` (default `1800`)
+- `WEBHOOK_TIMEOUT_SECONDS` (default `15`)
+- `WEBHOOK_RETRIES` (default `3`)
+- `WEBHOOK_BACKOFF_MS` (default `2000`)
+- `THUMBNAIL_YOLO_MODEL` (default worker: `yoloe-26s-seg.pt`)
+- `THUMBNAIL_YOLO_DEVICE` (default `cpu`)
+- `THUMBNAIL_PAIR_SKIP_EDGES` (default `2`)
+- `THUMBNAIL_PAIR_GAP` (default `5`)
+- `THUMBNAIL_PAIR_WIDTH` (default `1200`)
 
 ## Dependency Runtime
 
-- Python packages:
-  - `numpy`
-  - `Pillow`
-  - `opencv-contrib-python-headless`
-  - `ultralytics`
+- `numpy`
+- `Pillow`
+- `opencv-contrib-python-headless`
+- `ultralytics`
+- `pillow-avif-plugin`
 
 ## Build Check
 
@@ -138,3 +84,17 @@ Output sample:
 gofmt -w main.go
 go build ./...
 ```
+
+## Webhook Callback
+
+Jika request `POST /thumbnail` mengirim `webhook_url`, saat job selesai server mengirim:
+
+- Method: `POST`
+- Header: `Content-Type: application/json`
+- Body berisi metadata job (`job_id`, `status`, `job_url`, `image_url`, `result`, `error`, timestamp).
+
+Contoh field payload callback:
+
+- `event`: `thumbnail.job.completed`
+- `status`: `done` atau `failed`
+- `result.output_path`: URL endpoint image (bukan path file internal)

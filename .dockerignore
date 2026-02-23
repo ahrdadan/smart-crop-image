@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+bin
+run
+logs
+sample/out
+docker-data
+job-data
+smart-crop-image.exe
+*.log
