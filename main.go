@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,11 +30,14 @@ const (
 	defaultWebhookTimeoutSecs    = 15
 	defaultWebhookRetries        = 3
 	defaultWebhookBackoffMs      = 2000
+	defaultInlineImageMaxBytes   = 20 * 1024 * 1024
+	defaultInlineImageMaxCount   = 50
 )
 
 type ThumbnailRequest struct {
 	ImagePath        string      `json:"image_path"`
 	ImagePaths       []string    `json:"image_paths"`
+	ImageFiles       []imageFile `json:"image_files"`
 	OutputPath       string      `json:"output_path"`
 	ReturnCandidates bool        `json:"return_candidates"`
 	ComposeMode      string      `json:"compose_mode"`
@@ -42,6 +46,11 @@ type ThumbnailRequest struct {
 	ApplyCrop        bool        `json:"apply_crop"`
 	Quality          int         `json:"quality"`
 	WebhookURL       string      `json:"webhook_url"`
+}
+
+type imageFile struct {
+	Filename      string `json:"filename"`
+	ContentBase64 string `json:"content_base64"`
 }
 
 type CropResult struct {
@@ -112,6 +121,7 @@ type Job struct {
 	ID         string
 	Request    ThumbnailRequest
 	ImagePaths []string
+	ImageFiles []imageFile
 	JobDir     string
 	RequestLog string
 	OutputPath string
@@ -155,15 +165,18 @@ type JobManager struct {
 	processingID string
 	cond         *sync.Cond
 
-	queueCapacity int
-	storageDir    string
-	jobTTL        time.Duration
-	jobTimeout    time.Duration
-	webhookConfig webhookConfig
+	queueCapacity  int
+	storageDir     string
+	jobTTL         time.Duration
+	jobTimeout     time.Duration
+	webhookConfig  webhookConfig
+	inlineMaxBytes int
+	inlineMaxCount int
 }
 
 type apiServer struct {
-	jobs *JobManager
+	jobs      *JobManager
+	startedAt time.Time
 }
 
 type webhookConfig struct {
@@ -211,6 +224,18 @@ type jobResponse struct {
 	Webhook       webhookDeliveryStatus `json:"webhook"`
 }
 
+type healthResponse struct {
+	Status            string `json:"status"`
+	Time              string `json:"time"`
+	UptimeSeconds     int64  `json:"uptime_seconds"`
+	QueuedJobs        int    `json:"queued_jobs"`
+	HasProcessingJob  bool   `json:"has_processing_job"`
+	TrackedJobs       int    `json:"tracked_jobs"`
+	QueueCapacity     int    `json:"queue_capacity"`
+	JobTTLSeconds     int64  `json:"job_ttl_seconds"`
+	JobTimeoutSeconds int64  `json:"job_timeout_seconds"`
+}
+
 func main() {
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -249,6 +274,14 @@ func main() {
 	if webhookBackoff < 100*time.Millisecond {
 		webhookBackoff = time.Duration(defaultWebhookBackoffMs) * time.Millisecond
 	}
+	inlineMaxBytes := envInt("INLINE_IMAGE_MAX_BYTES", defaultInlineImageMaxBytes)
+	if inlineMaxBytes < (64 * 1024) {
+		inlineMaxBytes = defaultInlineImageMaxBytes
+	}
+	inlineMaxCount := envInt("INLINE_IMAGE_MAX_COUNT", defaultInlineImageMaxCount)
+	if inlineMaxCount < 1 {
+		inlineMaxCount = defaultInlineImageMaxCount
+	}
 
 	manager, err := newJobManager(
 		storageDir,
@@ -260,6 +293,8 @@ func main() {
 			Retries: webhookRetries,
 			Backoff: webhookBackoff,
 		},
+		inlineMaxBytes,
+		inlineMaxCount,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "job manager init failed: %v\n", err)
@@ -267,9 +302,14 @@ func main() {
 	}
 	manager.Start()
 
-	serverImpl := &apiServer{jobs: manager}
+	serverImpl := &apiServer{
+		jobs:      manager,
+		startedAt: time.Now().UTC(),
+	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", serverImpl.healthHandler)
+	mux.HandleFunc("/healthz", serverImpl.healthHandler)
 	mux.HandleFunc("/thumbnail", serverImpl.thumbnailHandler)
 	mux.HandleFunc("/job/", serverImpl.jobHandler)
 
@@ -282,13 +322,14 @@ func main() {
 	fmt.Printf("thumbnail API listening on :%s\n", port)
 	fmt.Printf("job queue: capacity=%d, ttl=%s, storage=%s\n", queueCapacity, jobTTL, storageDir)
 	fmt.Printf("webhook: timeout=%s retries=%d backoff=%s\n", webhookTimeout, webhookRetries, webhookBackoff)
+	fmt.Printf("inline image: max_count=%d max_bytes=%d\n", inlineMaxCount, inlineMaxBytes)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func newJobManager(storageDir string, queueCapacity int, ttl, timeout time.Duration, webhookCfg webhookConfig) (*JobManager, error) {
+func newJobManager(storageDir string, queueCapacity int, ttl, timeout time.Duration, webhookCfg webhookConfig, inlineMaxBytes, inlineMaxCount int) (*JobManager, error) {
 	absStorage, err := filepath.Abs(storageDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve job storage dir failed: %w", err)
@@ -298,13 +339,15 @@ func newJobManager(storageDir string, queueCapacity int, ttl, timeout time.Durat
 	}
 
 	manager := &JobManager{
-		jobs:          make(map[string]*Job),
-		queue:         make([]string, 0),
-		queueCapacity: queueCapacity,
-		storageDir:    absStorage,
-		jobTTL:        ttl,
-		jobTimeout:    timeout,
-		webhookConfig: webhookCfg,
+		jobs:           make(map[string]*Job),
+		queue:          make([]string, 0),
+		queueCapacity:  queueCapacity,
+		storageDir:     absStorage,
+		jobTTL:         ttl,
+		jobTimeout:     timeout,
+		webhookConfig:  webhookCfg,
+		inlineMaxBytes: inlineMaxBytes,
+		inlineMaxCount: inlineMaxCount,
 	}
 	manager.cond = sync.NewCond(&manager.mu)
 	return manager, nil
@@ -315,7 +358,7 @@ func (m *JobManager) Start() {
 	go m.cleanupLoop()
 }
 
-func (m *JobManager) Enqueue(req ThumbnailRequest, imagePaths []string, baseURL string) (*Job, int, int, error) {
+func (m *JobManager) Enqueue(req ThumbnailRequest, imagePaths []string, imageFiles []imageFile, baseURL string) (*Job, int, int, error) {
 	now := time.Now().UTC()
 	jobID, err := newJobID()
 	if err != nil {
@@ -334,10 +377,14 @@ func (m *JobManager) Enqueue(req ThumbnailRequest, imagePaths []string, baseURL 
 		return nil, 0, 0, fmt.Errorf("write request payload failed: %w", err)
 	}
 
+	reqForJob := req
+	reqForJob.ImageFiles = nil
+
 	job := &Job{
 		ID:         jobID,
-		Request:    req,
+		Request:    reqForJob,
 		ImagePaths: append([]string(nil), imagePaths...),
+		ImageFiles: append([]imageFile(nil), imageFiles...),
 		JobDir:     jobDir,
 		RequestLog: requestPath,
 		OutputPath: outputPath,
@@ -430,7 +477,17 @@ func (m *JobManager) processJob(job *Job) (ThumbnailResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), m.jobTimeout)
 	defer cancel()
 
-	pair, err := runPythonSmartPair(ctx, job.ImagePaths, job.OutputPath)
+	allPaths := append([]string(nil), job.ImagePaths...)
+	inlinePaths, err := m.writeInlineImageFiles(job)
+	if err != nil {
+		return ThumbnailResponse{}, err
+	}
+	allPaths = append(allPaths, inlinePaths...)
+	if len(allPaths) == 0 {
+		return ThumbnailResponse{}, errors.New("no valid input images found for job")
+	}
+
+	pair, err := runPythonSmartPair(ctx, allPaths, job.OutputPath)
 	if err != nil {
 		return ThumbnailResponse{}, err
 	}
@@ -440,6 +497,78 @@ func (m *JobManager) processJob(job *Job) (ThumbnailResponse, error) {
 		resp.Candidates = nil
 	}
 	return resp, nil
+}
+
+func (m *JobManager) writeInlineImageFiles(job *Job) ([]string, error) {
+	if len(job.ImageFiles) == 0 {
+		return nil, nil
+	}
+	if len(job.ImageFiles) > m.inlineMaxCount {
+		return nil, fmt.Errorf("image_files exceeds max count (%d)", m.inlineMaxCount)
+	}
+
+	paths := make([]string, 0, len(job.ImageFiles))
+	for idx, file := range job.ImageFiles {
+		raw := strings.TrimSpace(file.ContentBase64)
+		if raw == "" {
+			return nil, fmt.Errorf("image_files[%d].content_base64 is required", idx)
+		}
+
+		bin, err := decodeBase64Image(raw)
+		if err != nil {
+			return nil, fmt.Errorf("image_files[%d] decode failed: %w", idx, err)
+		}
+		if len(bin) == 0 {
+			return nil, fmt.Errorf("image_files[%d] is empty", idx)
+		}
+		if len(bin) > m.inlineMaxBytes {
+			return nil, fmt.Errorf("image_files[%d] exceeds max bytes (%d)", idx, m.inlineMaxBytes)
+		}
+
+		filename := inlineImageFilename(file.Filename, idx)
+		target := filepath.Join(job.JobDir, filename)
+		if err := os.WriteFile(target, bin, 0o644); err != nil {
+			return nil, fmt.Errorf("image_files[%d] write failed: %w", idx, err)
+		}
+		paths = append(paths, target)
+	}
+	return paths, nil
+}
+
+func decodeBase64Image(raw string) ([]byte, error) {
+	text := strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToLower(text), "data:") {
+		if cut := strings.Index(text, ","); cut >= 0 && cut < len(text)-1 {
+			text = text[cut+1:]
+		}
+	}
+
+	decoders := []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	}
+	var lastErr error
+	for _, decoder := range decoders {
+		data, err := decoder(text)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("invalid base64")
+	}
+	return nil, lastErr
+}
+
+func inlineImageFilename(input string, idx int) string {
+	ext := strings.ToLower(filepath.Ext(filepath.Base(strings.TrimSpace(input))))
+	if ext == "" || len(ext) > 12 || strings.Contains(ext, "/") || strings.Contains(ext, "\\") {
+		ext = ".img"
+	}
+	return fmt.Sprintf("upload-%03d%s", idx+1, ext)
 }
 
 func (m *JobManager) deliverWebhook(jobID string) {
@@ -665,6 +794,19 @@ func (m *JobManager) queuePositionLocked(jobID string) int {
 	return -1
 }
 
+func (m *JobManager) healthStats() (queuedJobs int, hasProcessing bool, trackedJobs int, queueCapacity int, ttlSeconds int64, timeoutSeconds int64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	queuedJobs = len(m.queue)
+	hasProcessing = m.processingID != ""
+	trackedJobs = len(m.jobs)
+	queueCapacity = m.queueCapacity
+	ttlSeconds = int64(m.jobTTL.Seconds())
+	timeoutSeconds = int64(m.jobTimeout.Seconds())
+	return
+}
+
 func (s *apiServer) thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -678,8 +820,13 @@ func (s *apiServer) thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	paths := collectInputPaths(req)
-	if len(paths) == 0 {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "image_paths or image_path is required"})
+	imageFiles, err := sanitizeImageFiles(req.ImageFiles)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(paths) == 0 && len(imageFiles) == 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "image_paths, image_path, or image_files is required"})
 		return
 	}
 
@@ -690,7 +837,7 @@ func (s *apiServer) thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	req.WebhookURL = webhookURL
 
-	job, queuePos, pendingJobs, err := s.jobs.Enqueue(req, paths, buildBaseURL(r))
+	job, queuePos, pendingJobs, err := s.jobs.Enqueue(req, paths, imageFiles, buildBaseURL(r))
 	if err != nil {
 		respondJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
@@ -708,6 +855,28 @@ func (s *apiServer) thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 		WebhookEnabled:  strings.TrimSpace(job.Request.WebhookURL) != "",
 	}
 	respondJSON(w, http.StatusAccepted, resp)
+}
+
+func (s *apiServer) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	now := time.Now().UTC()
+	queuedJobs, hasProcessing, trackedJobs, queueCapacity, ttlSeconds, timeoutSeconds := s.jobs.healthStats()
+	resp := healthResponse{
+		Status:            "ok",
+		Time:              now.Format(time.RFC3339),
+		UptimeSeconds:     int64(now.Sub(s.startedAt).Seconds()),
+		QueuedJobs:        queuedJobs,
+		HasProcessingJob:  hasProcessing,
+		TrackedJobs:       trackedJobs,
+		QueueCapacity:     queueCapacity,
+		JobTTLSeconds:     ttlSeconds,
+		JobTimeoutSeconds: timeoutSeconds,
+	}
+	respondJSON(w, http.StatusOK, resp)
 }
 
 func (s *apiServer) jobHandler(w http.ResponseWriter, r *http.Request) {
@@ -878,6 +1047,24 @@ func cleanImagePaths(paths []string) []string {
 		}
 	}
 	return out
+}
+
+func sanitizeImageFiles(files []imageFile) ([]imageFile, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	out := make([]imageFile, 0, len(files))
+	for idx, file := range files {
+		content := strings.TrimSpace(file.ContentBase64)
+		if content == "" {
+			return nil, fmt.Errorf("image_files[%d].content_base64 is required", idx)
+		}
+		out = append(out, imageFile{
+			Filename:      strings.TrimSpace(file.Filename),
+			ContentBase64: content,
+		})
+	}
+	return out, nil
 }
 
 func runPythonSmartPair(ctx context.Context, imagePaths []string, outputPath string) (smartPairResult, error) {
@@ -1148,11 +1335,20 @@ func parseQuality(raw string) (int, error) {
 }
 
 func writeJobPayloadLog(path string, req ThumbnailRequest, imagePaths []string, outputPath string, createdAt time.Time) error {
+	reqForLog := req
+	inlineFileNames := make([]string, 0, len(req.ImageFiles))
+	for _, file := range req.ImageFiles {
+		inlineFileNames = append(inlineFileNames, strings.TrimSpace(file.Filename))
+	}
+	reqForLog.ImageFiles = nil
+
 	logBody := map[string]interface{}{
 		"created_at":           createdAt.Format(time.RFC3339),
-		"request":              req,
+		"request":              reqForLog,
 		"resolved_image_paths": imagePaths,
 		"resolved_output_path": outputPath,
+		"inline_image_count":   len(req.ImageFiles),
+		"inline_image_names":   inlineFileNames,
 	}
 	data, err := json.MarshalIndent(logBody, "", "  ")
 	if err != nil {

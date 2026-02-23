@@ -13,6 +13,7 @@ function parseArgs(argv) {
     quality: 95,
     pollIntervalMs: 2000,
     timeoutMs: 10 * 60 * 1000,
+    embedLocalImages: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -50,6 +51,9 @@ function parseArgs(argv) {
       case "--timeout-ms":
         opts.timeoutMs = Number.parseInt(val, 10);
         break;
+      case "--embed-local-images":
+        opts.embedLocalImages = parseBool(val, "--embed-local-images");
+        break;
       default:
         throw new Error(`Unknown option: ${key}`);
     }
@@ -72,6 +76,17 @@ function parseArgs(argv) {
   }
 
   return opts;
+}
+
+function parseBool(value, keyName) {
+  const v = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(v)) {
+    return true;
+  }
+  if (["0", "false", "no", "n", "off"].includes(v)) {
+    return false;
+  }
+  throw new Error(`${keyName} must be true/false`);
 }
 
 function sleep(ms) {
@@ -118,15 +133,59 @@ function buildImageURL(base, opts) {
   return url.toString();
 }
 
+function collectLocalImagePaths(payload) {
+  const paths = [];
+  if (Array.isArray(payload.image_paths)) {
+    for (const item of payload.image_paths) {
+      const text = String(item || "").trim();
+      if (text) {
+        paths.push(text);
+      }
+    }
+  }
+  if (typeof payload.image_path === "string" && payload.image_path.trim()) {
+    paths.push(payload.image_path.trim());
+  }
+  return paths;
+}
+
+async function buildSubmitPayload(payload, opts) {
+  const out = JSON.parse(JSON.stringify(payload ?? {}));
+  if (!opts.embedLocalImages) {
+    return out;
+  }
+
+  const localPaths = collectLocalImagePaths(out);
+  if (localPaths.length === 0) {
+    return out;
+  }
+
+  const imageFiles = [];
+  for (const imagePath of localPaths) {
+    const fileBuf = await fs.readFile(imagePath);
+    imageFiles.push({
+      filename: path.basename(imagePath),
+      content_base64: fileBuf.toString("base64"),
+    });
+  }
+
+  const existing = Array.isArray(out.image_files) ? out.image_files : [];
+  out.image_files = [...existing, ...imageFiles];
+  out.image_paths = [];
+  delete out.image_path;
+  return out;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const payload = await readJson(opts.payload);
+  const submitPayload = await buildSubmitPayload(payload, opts);
 
   const submitURL = `${opts.api.replace(/\/+$/, "")}/thumbnail`;
   const enqueue = await requestJson(submitURL, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(submitPayload),
   });
 
   if (!enqueue.ok) {
@@ -141,6 +200,9 @@ async function main() {
 
   console.log(`[ENQUEUE] job_id=${jobID} queue_position=${enqueueBody.queue_position}`);
   console.log(`[ENQUEUE] job_url=${jobURL}`);
+  if (opts.embedLocalImages) {
+    console.log("[ENQUEUE] local image paths embedded as image_files");
+  }
 
   const started = Date.now();
   let lastStatus = "";

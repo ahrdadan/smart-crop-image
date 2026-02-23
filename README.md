@@ -9,12 +9,16 @@ Service ini memakai arsitektur **Go API + Python worker** dengan flow async:
 
 ## Endpoint
 
+- `GET /health` atau `GET /healthz`  
+  Health check service + metrik queue.
 - `POST /thumbnail`  
   Submit job baru (async queue).
 - `GET /job/{id}`  
   Cek status queue/progress/result.
 - `GET /job/{id}/image?format=jpg|avif&width=...&quality=...`  
   Ambil hasil gambar dengan opsi konversi.
+- `image_files` (opsional di payload `POST /thumbnail`)  
+  Upload gambar langsung via Base64 untuk server remote (tanpa shared filesystem).
 - `webhook_url` (opsional di payload `POST /thumbnail`)  
   Jika diisi, server akan POST callback saat job selesai (`done` atau `failed`).
 
@@ -25,6 +29,7 @@ Service ini memakai arsitektur **Go API + Python worker** dengan flow async:
 - TTL job artifact: payload + output gambar dihapus otomatis setelah **2 jam** (default).
 - Output path ditentukan server per job, bukan dari client.
 - Callback webhook async dengan retry.
+- Dukungan `image_files` Base64 untuk kirim file dari client ke server deploy.
 
 ## Docker Quick Start
 
@@ -50,6 +55,47 @@ Panduan Git Bash lengkap:
 Sample client Node.js:
 
 - `sample/nodejs/submit_thumbnail_job.mjs`
+- mode remote: gunakan flag `--embed-local-images true` agar `image_paths` lokal dikirim sebagai `image_files`.
+
+## Cara Menjalankan Sample Node.js
+
+Pastikan API sudah jalan di `:8080` (lokal atau URL deploy).
+
+Jalankan dari root project:
+
+```bash
+node sample/nodejs/submit_thumbnail_job.mjs \
+  --api http://127.0.0.1:8080 \
+  --payload sample/nodejs/payload.local.json \
+  --output sample/nodejs/out/result-local.jpg \
+  --format jpg \
+  --quality 90
+```
+
+Jalankan dari folder `sample/nodejs`:
+
+```bash
+cd sample/nodejs
+node submit_thumbnail_job.mjs \
+  --api http://127.0.0.1:8080 \
+  --payload ./payload.local.json \
+  --output ./out/result-local.jpg \
+  --format jpg \
+  --quality 90
+```
+
+Jalankan ke server deploy (remote) dari folder `sample/nodejs`:
+
+```bash
+cd sample/nodejs
+node submit_thumbnail_job.mjs \
+  --api https://your-deployed-domain \
+  --payload ./payload.local.json \
+  --output ./out/result-remote.jpg \
+  --embed-local-images true \
+  --format jpg \
+  --quality 90
+```
 
 ## Environment Variables
 
@@ -64,6 +110,8 @@ Sample client Node.js:
 - `WEBHOOK_TIMEOUT_SECONDS` (default `15`)
 - `WEBHOOK_RETRIES` (default `3`)
 - `WEBHOOK_BACKOFF_MS` (default `2000`)
+- `INLINE_IMAGE_MAX_BYTES` (default `20971520`)
+- `INLINE_IMAGE_MAX_COUNT` (default `50`)
 - `THUMBNAIL_YOLO_MODEL` (default worker: `yoloe-26s-seg.pt`)
 - `THUMBNAIL_YOLO_DEVICE` (default `cpu`)
 - `THUMBNAIL_PAIR_SKIP_EDGES` (default `2`)

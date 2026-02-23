@@ -60,6 +60,7 @@ Cek:
 ```bash
 docker ps --filter name=smart-crop-api
 docker logs smart-crop-api
+curl -sS "http://127.0.0.1:8080/health"
 ```
 
 ## 4) Buat Payload Submit Job
@@ -82,6 +83,11 @@ JSON
 ```
 
 Jika tidak butuh webhook, hapus field `webhook_url`.
+
+Catatan:
+
+- `image_paths`/`image_path` dipakai jika server bisa akses path tersebut.
+- Untuk server deploy (remote) yang tidak bisa baca file lokal kamu, gunakan `image_files` (Base64) atau pakai script Node dengan `--embed-local-images true`.
 
 ## 5) Submit ke Queue (`POST /thumbnail`)
 
@@ -232,6 +238,11 @@ curl -sS -X POST "http://127.0.0.1:8080/thumbnail" \
 
 - Callback belum terkirim atau gagal; cek field `webhook.last_error` dari endpoint `GET /job/{id}`.
 
+`image_paths, image_path, or image_files is required`
+
+- Kirim salah satu sumber input: `image_paths`, `image_path`, atau `image_files`.
+- Untuk server remote, paling aman gunakan `--embed-local-images true` di script Node.
+
 ## 11) Stop Container
 
 ```bash
@@ -285,6 +296,18 @@ node sample/nodejs/submit_thumbnail_job.mjs \
   --quality 90
 ```
 
+### Jalankan ke server deploy (remote) dengan file lokal
+
+```bash
+node sample/nodejs/submit_thumbnail_job.mjs \
+  --api https://your-deployed-domain \
+  --payload sample/nodejs/payload.local.json \
+  --output sample/nodejs/out/result-remote.jpg \
+  --embed-local-images true \
+  --format jpg \
+  --quality 90
+```
+
 Output script:
 
 - File gambar hasil (sesuai `--output`)
@@ -298,5 +321,6 @@ Opsi script:
 - `--format` `jpg|jpeg|avif` (default `jpg`)
 - `--width` default `0` (tanpa resize)
 - `--quality` `0..100` (default `95`)
+- `--embed-local-images` `true|false` (default `false`)
 - `--poll-interval-ms` default `2000`
 - `--timeout-ms` default `600000`
