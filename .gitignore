@@ -27,5 +27,6 @@ Thumbs.db
 # Generated sample outputs
 sample/out/
 sample/*.json
+sample/nodejs/sample-image/
 
 sample/image-test/
