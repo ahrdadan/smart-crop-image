@@ -5,39 +5,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
-	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	defaultRatio           = 16.0 / 9.0
-	defaultMaxAnalysisSize = 512
-	defaultPort            = "8080"
-)
+const defaultPort = "8080"
 
 type ThumbnailRequest struct {
 	ImagePath        string      `json:"image_path"`
 	ImagePaths       []string    `json:"image_paths"`
-	ImageWidth       int         `json:"image_width"`
-	ImageHeight      int         `json:"image_height"`
+	OutputPath       string      `json:"output_path"`
+	ReturnCandidates bool        `json:"return_candidates"`
+	ComposeMode      string      `json:"compose_mode"`
 	PreferredRatio   interface{} `json:"preferred_ratio"`
 	MaxAnalysisSize  int         `json:"max_analysis_size"`
 	ApplyCrop        bool        `json:"apply_crop"`
-	OutputPath       string      `json:"output_path"`
 	Quality          int         `json:"quality"`
-	ReturnCandidates bool        `json:"return_candidates"`
-	ComposeMode      string      `json:"compose_mode"`
 }
 
 type CropResult struct {
@@ -47,6 +35,18 @@ type CropResult struct {
 	CropHeight int     `json:"crop_height"`
 	Method     string  `json:"method"`
 	Confidence float64 `json:"confidence"`
+}
+
+type ThumbnailCandidate struct {
+	PageIndex  int     `json:"page_index"`
+	ImagePath  string  `json:"image_path"`
+	CropX      int     `json:"crop_x"`
+	CropY      int     `json:"crop_y"`
+	CropWidth  int     `json:"crop_width"`
+	CropHeight int     `json:"crop_height"`
+	Method     string  `json:"method"`
+	Confidence float64 `json:"confidence"`
+	Score      float64 `json:"score"`
 }
 
 type ThumbnailResponse struct {
@@ -63,17 +63,19 @@ type ThumbnailResponse struct {
 	Candidates        []ThumbnailCandidate `json:"candidates,omitempty"`
 }
 
-type ThumbnailCandidate struct {
-	PageIndex     int     `json:"page_index"`
-	ImagePath     string  `json:"image_path"`
-	CropX         int     `json:"crop_x"`
-	CropY         int     `json:"crop_y"`
-	CropWidth     int     `json:"crop_width"`
-	CropHeight    int     `json:"crop_height"`
-	Method        string  `json:"method"`
-	Confidence    float64 `json:"confidence"`
-	Score         float64 `json:"score"`
-	WorkerWarning string  `json:"worker_warning,omitempty"`
+type smartPairPicked struct {
+	Idx       int     `json:"idx"`
+	Path      string  `json:"path"`
+	Total     float64 `json:"total"`
+	TextRatio float64 `json:"text_ratio"`
+	InEdge    bool    `json:"in_edge"`
+	BBox      []int   `json:"bbox"`
+}
+
+type smartPairResult struct {
+	OutPath string            `json:"out_path"`
+	Size    []int             `json:"size"`
+	Picked  []smartPairPicked `json:"picked"`
 }
 
 type commandCandidate struct {
@@ -82,16 +84,13 @@ type commandCandidate struct {
 }
 
 func main() {
-	port := os.Getenv("PORT")
-	if strings.TrimSpace(port) == "" {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
 		port = defaultPort
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/thumbnail", thumbnailHandler)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
 
 	server := &http.Server{
 		Addr:              ":" + port,
@@ -113,168 +112,60 @@ func thumbnailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ThumbnailRequest
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
 
-	resp := ThumbnailResponse{Applied: false}
-	sourceImagePath := strings.TrimSpace(req.ImagePath)
-	chapterMode := len(cleanImagePaths(req.ImagePaths)) > 0
-
-	if chapterMode {
-		resp = generateChapterThumbnail(r.Context(), req)
-		sourceImagePath = resp.SelectedImagePath
-	} else {
-		crop, warnErr := GenerateThumbnailCrop(r.Context(), req)
-		resp.CropResult = crop
-		if warnErr != nil {
-			resp.WorkerWarning = warnErr.Error()
-		}
+	paths := collectInputPaths(req)
+	if len(paths) == 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "image_paths or image_path is required"})
+		return
 	}
 
-	if shouldApplyCrop(req) {
-		outputPath := resolveOutputPath(sourceImagePath, req.OutputPath)
-		if shouldComposePair(req) && chapterMode {
-			if err := applyPairComposeWithVips(r.Context(), req, &resp, outputPath); err != nil {
-				resp.CropError = "pair compose failed: " + err.Error()
-				// Fallback to single-image crop for robustness.
-				if err2 := applyCropWithVips(r.Context(), sourceImagePath, outputPath, resp.CropResult, req.Quality); err2 != nil {
-					resp.CropError = resp.CropError + " | single fallback failed: " + err2.Error()
-				} else {
-					resp.Applied = true
-					resp.OutputPath = outputPath
-					resp.CompositionMode = "single-fallback"
-				}
-			}
-		} else {
-			if err := applyCropWithVips(r.Context(), sourceImagePath, outputPath, resp.CropResult, req.Quality); err != nil {
-				resp.CropError = err.Error()
-			} else {
-				resp.Applied = true
-				resp.OutputPath = outputPath
-				resp.CompositionMode = "single"
-			}
-		}
+	outputPath := resolveOutputPath(paths[0], req.OutputPath)
+	resp := ThumbnailResponse{
+		Applied:         false,
+		OutputPath:      outputPath,
+		CompositionMode: "pair-smart-thumb",
 	}
-	if !req.ReturnCandidates && !shouldComposePair(req) {
+
+	pair, err := runPythonSmartPair(r.Context(), paths, outputPath)
+	if err != nil {
+		resp.CropError = err.Error()
+		respondJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	resp = buildPairResponse(req, pair, outputPath)
+	if !req.ReturnCandidates {
 		resp.Candidates = nil
 	}
-
 	respondJSON(w, http.StatusOK, resp)
 }
 
-func generateChapterThumbnail(ctx context.Context, req ThumbnailRequest) ThumbnailResponse {
+func collectInputPaths(req ThumbnailRequest) []string {
 	paths := cleanImagePaths(req.ImagePaths)
-	resp := ThumbnailResponse{Applied: false}
-	if len(paths) == 0 {
-		return resp
-	}
-
-	candidates := make([]ThumbnailCandidate, 0, len(paths))
-	bestIndex := -1
-	bestScore := -1.0
-	warnings := make([]string, 0)
-
-	for idx, imagePath := range paths {
-		pageReq := req
-		pageReq.ImagePath = imagePath
-		pageReq.ImagePaths = nil
-		pageReq.ImageWidth = 0
-		pageReq.ImageHeight = 0
-
-		crop, warnErr := GenerateThumbnailCrop(ctx, pageReq)
-		score := scoreCandidate(crop)
-
-		candidate := ThumbnailCandidate{
-			PageIndex:  idx,
-			ImagePath:  imagePath,
-			CropX:      crop.CropX,
-			CropY:      crop.CropY,
-			CropWidth:  crop.CropWidth,
-			CropHeight: crop.CropHeight,
-			Method:     crop.Method,
-			Confidence: crop.Confidence,
-			Score:      roundFloat(score, 4),
+	single := strings.TrimSpace(req.ImagePath)
+	if single != "" {
+		already := false
+		for _, item := range paths {
+			if filepath.Clean(item) == filepath.Clean(single) {
+				already = true
+				break
+			}
 		}
-
-		if warnErr != nil {
-			candidate.WorkerWarning = warnErr.Error()
-			warnings = append(warnings, fmt.Sprintf("page %d: %s", idx, warnErr.Error()))
-		}
-
-		candidates = append(candidates, candidate)
-		if isBetterCandidate(score, idx, bestScore, bestIndex) {
-			bestScore = score
-			bestIndex = idx
+		if !already {
+			paths = append(paths, single)
 		}
 	}
-
-	if bestIndex < 0 {
-		fallback := fallbackCrop(maxInt(req.ImageWidth, 0), maxInt(req.ImageHeight, 0), parseRatio(req.PreferredRatio))
-		resp.CropResult = fallback
-		resp.CropResult.Method = "fallback"
-		resp.CropResult.Confidence = 0.0
-	} else {
-		selected := candidates[bestIndex]
-		resp.CropResult = CropResult{
-			CropX:      selected.CropX,
-			CropY:      selected.CropY,
-			CropWidth:  selected.CropWidth,
-			CropHeight: selected.CropHeight,
-			Method:     selected.Method,
-			Confidence: selected.Confidence,
-		}
-		resp.SelectedImagePath = selected.ImagePath
-		resp.SelectedScore = selected.Score
-		selectedIndex := selected.PageIndex
-		resp.SelectedPageIndex = &selectedIndex
-	}
-
-	resp.Candidates = candidates
-	if len(warnings) > 0 {
-		resp.WorkerWarning = strings.Join(warnings, " | ")
-	}
-
-	return resp
+	return cleanImagePaths(paths)
 }
 
-func GenerateThumbnailCrop(ctx context.Context, req ThumbnailRequest) (CropResult, error) {
-	ratio := parseRatio(req.PreferredRatio)
-	if req.MaxAnalysisSize <= 0 {
-		req.MaxAnalysisSize = defaultMaxAnalysisSize
-	}
-	if req.PreferredRatio == nil {
-		req.PreferredRatio = "16:9"
-	}
-
-	width, height := resolveDimensions(req)
-
-	result, err := runPythonWorker(ctx, req)
-	if err == nil {
-		bounded := ensureInBounds(result.CropX, result.CropY, result.CropWidth, result.CropHeight, width, height, ratio)
-		result.CropX = bounded.CropX
-		result.CropY = bounded.CropY
-		result.CropWidth = bounded.CropWidth
-		result.CropHeight = bounded.CropHeight
-		if strings.TrimSpace(result.Method) == "" {
-			result.Method = "fallback"
-		}
-		result.Confidence = clamp(result.Confidence, 0.0, 1.0)
-		return result, nil
-	}
-
-	fallback := fallbackCrop(width, height, ratio)
-	fallback.Method = "fallback"
-	fallback.Confidence = 0.0
-	return fallback, err
-}
-
-func runPythonWorker(ctx context.Context, req ThumbnailRequest) (CropResult, error) {
-	workerPath := os.Getenv("THUMBNAIL_WORKER_PATH")
-	if strings.TrimSpace(workerPath) == "" {
-		workerPath = "thumbnail_worker.py"
+func runPythonSmartPair(ctx context.Context, imagePaths []string, outputPath string) (smartPairResult, error) {
+	workerPath := strings.TrimSpace(os.Getenv("SMART_THUMB_WORKER_PATH"))
+	if workerPath == "" {
+		workerPath = "smart_thumb.py"
 	}
 	if !filepath.IsAbs(workerPath) {
 		abs, err := filepath.Abs(workerPath)
@@ -282,323 +173,67 @@ func runPythonWorker(ctx context.Context, req ThumbnailRequest) (CropResult, err
 			workerPath = abs
 		}
 	}
-
 	if _, err := os.Stat(workerPath); err != nil {
-		return CropResult{}, fmt.Errorf("worker not found at %s", workerPath)
+		return smartPairResult{}, fmt.Errorf("smart pair worker not found at %s", workerPath)
 	}
 
-	payload, err := json.Marshal(req)
+	payload := map[string]interface{}{
+		"image_paths": imagePaths,
+		"output_path": outputPath,
+		"skip_edges":  envInt("THUMBNAIL_PAIR_SKIP_EDGES", 2),
+		"gap":         envInt("THUMBNAIL_PAIR_GAP", 5),
+		"width":       envInt("THUMBNAIL_PAIR_WIDTH", 1200),
+	}
+	if model := strings.TrimSpace(os.Getenv("THUMBNAIL_YOLO_MODEL")); model != "" {
+		payload["yolo_model_name"] = model
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return CropResult{}, fmt.Errorf("marshal request failed: %w", err)
+		return smartPairResult{}, fmt.Errorf("marshal smart pair request failed: %w", err)
 	}
 
 	var attempts []string
 	for _, cand := range pythonCandidates() {
-		callArgs := make([]string, 0, len(cand.Args)+3)
-		callArgs = append(callArgs, cand.Args...)
-		callArgs = append(callArgs, workerPath, "--input-json", string(payload))
+		args := make([]string, 0, len(cand.Args)+3)
+		args = append(args, cand.Args...)
+		args = append(args, workerPath, "--input-json", string(body))
 
-		cmd := exec.CommandContext(ctx, cand.Bin, callArgs...)
-		cmdOutput, cmdErr := cmd.CombinedOutput()
-		output := strings.TrimSpace(string(cmdOutput))
+		cmd := exec.CommandContext(ctx, cand.Bin, args...)
+		outBytes, cmdErr := cmd.CombinedOutput()
+		output := strings.TrimSpace(string(outBytes))
 		if cmdErr != nil {
 			attempts = append(attempts, fmt.Sprintf("%s failed: %v", cand.Bin, cmdErr))
 			continue
 		}
-
-		parsed, parseErr := parseWorkerOutput(output)
+		result, parseErr := parseSmartPairOutput(output)
 		if parseErr != nil {
 			attempts = append(attempts, fmt.Sprintf("%s output parse failed: %v", cand.Bin, parseErr))
 			continue
 		}
-		return parsed, nil
+		if _, statErr := os.Stat(result.OutPath); statErr != nil {
+			attempts = append(attempts, fmt.Sprintf("%s output file missing: %v", cand.Bin, statErr))
+			continue
+		}
+		return result, nil
 	}
 
 	if len(attempts) == 0 {
-		return CropResult{}, errors.New("no python candidate configured")
+		return smartPairResult{}, errors.New("no python candidate configured")
 	}
-	return CropResult{}, errors.New(strings.Join(attempts, "; "))
+	return smartPairResult{}, errors.New(strings.Join(attempts, "; "))
 }
 
-func shouldApplyCrop(req ThumbnailRequest) bool {
-	if req.ApplyCrop {
-		return true
-	}
-	return strings.TrimSpace(req.OutputPath) != ""
-}
-
-func shouldComposePair(req ThumbnailRequest) bool {
-	mode := strings.ToLower(strings.TrimSpace(req.ComposeMode))
-	return mode == "pair" || mode == "dual" || mode == "2up"
-}
-
-func resolveOutputPath(inputPath, outputPath string) string {
-	if strings.TrimSpace(outputPath) != "" {
-		return outputPath
-	}
-	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
-	ext := strings.ToLower(filepath.Ext(inputPath))
-	if ext == "" {
-		ext = ".jpg"
-	}
-	return filepath.Join(filepath.Dir(inputPath), base+"_thumb"+ext)
-}
-
-func applyCropWithVips(ctx context.Context, inputPath, outputPath string, crop CropResult, quality int) error {
-	if strings.TrimSpace(inputPath) == "" {
-		return errors.New("image_path is required to apply crop")
-	}
-	if strings.TrimSpace(outputPath) == "" {
-		return errors.New("output_path is empty")
-	}
-	if crop.CropWidth <= 0 || crop.CropHeight <= 0 {
-		return errors.New("invalid crop size")
-	}
-	if _, err := os.Stat(inputPath); err != nil {
-		return fmt.Errorf("image not found: %s", inputPath)
-	}
-
-	quality = normalizeQuality(quality)
-
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return fmt.Errorf("create output directory failed: %w", err)
-	}
-
-	vipsBinary, err := exec.LookPath("vips")
-	if err != nil {
-		return errors.New("libvips CLI not found (install `vips` and ensure it is in PATH)")
-	}
-
-	if err := runVipsCropRaw(ctx, vipsBinary, inputPath, outputPath, crop, quality); err != nil {
-		return err
-	}
-	return nil
-}
-
-func applyPairComposeWithVips(ctx context.Context, req ThumbnailRequest, resp *ThumbnailResponse, outputPath string) error {
-	if resp == nil {
-		return errors.New("empty response object")
-	}
-	leftCand, rightCand, ok := topTwoCandidates(resp.Candidates)
-	if !ok {
-		return errors.New("not enough candidates for pair composition")
-	}
-
-	leftCrop, leftWarn := generateCropForImageRatio(ctx, req, leftCand.ImagePath, "8:9")
-	rightCrop, rightWarn := generateCropForImageRatio(ctx, req, rightCand.ImagePath, "8:9")
-	if leftWarn != nil || rightWarn != nil {
-		warnings := make([]string, 0, 2)
-		if leftWarn != nil {
-			warnings = append(warnings, "left:"+leftWarn.Error())
-		}
-		if rightWarn != nil {
-			warnings = append(warnings, "right:"+rightWarn.Error())
-		}
-		if len(warnings) > 0 {
-			if strings.TrimSpace(resp.WorkerWarning) == "" {
-				resp.WorkerWarning = strings.Join(warnings, " | ")
-			} else {
-				resp.WorkerWarning = resp.WorkerWarning + " | " + strings.Join(warnings, " | ")
-			}
-		}
-	}
-
-	leftW, leftH := resolveDimensions(ThumbnailRequest{ImagePath: leftCand.ImagePath})
-	rightW, rightH := resolveDimensions(ThumbnailRequest{ImagePath: rightCand.ImagePath})
-	if leftW <= 0 || leftH <= 0 || rightW <= 0 || rightH <= 0 {
-		return errors.New("cannot resolve dimensions for pair compose source images")
-	}
-
-	panelH := minInt(leftCrop.CropHeight, rightCrop.CropHeight)
-	if panelH <= 0 {
-		panelH = minInt(leftH, rightH)
-	}
-	panelW := int(math.Round(float64(panelH) * (8.0 / 9.0)))
-	if panelW <= 0 || panelH <= 0 {
-		return errors.New("invalid panel size for pair compose")
-	}
-
-	leftNorm := retargetCropToSize(leftCrop, panelW, panelH, leftW, leftH)
-	rightNorm := retargetCropToSize(rightCrop, panelW, panelH, rightW, rightH)
-
-	vipsBinary, err := exec.LookPath("vips")
-	if err != nil {
-		return errors.New("libvips CLI not found (install `vips` and ensure it is in PATH)")
-	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return fmt.Errorf("create output directory failed: %w", err)
-	}
-
-	tmpDir, err := os.MkdirTemp("", "thumb_pair_*")
-	if err != nil {
-		return fmt.Errorf("cannot create temp dir for pair compose: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	leftTmp := filepath.Join(tmpDir, "left.png")
-	rightTmp := filepath.Join(tmpDir, "right.png")
-	quality := normalizeQuality(req.Quality)
-
-	if err := runVipsCropRaw(ctx, vipsBinary, leftCand.ImagePath, leftTmp, leftNorm, quality); err != nil {
-		return fmt.Errorf("left crop failed: %w", err)
-	}
-	if err := runVipsCropRaw(ctx, vipsBinary, rightCand.ImagePath, rightTmp, rightNorm, quality); err != nil {
-		return fmt.Errorf("right crop failed: %w", err)
-	}
-
-	outputSpec := buildVipsOutputSpec(outputPath, quality)
-	joinArgs := []string{"join", leftTmp, rightTmp, outputSpec, "horizontal"}
-	if err := runVipsCommand(ctx, vipsBinary, joinArgs); err != nil {
-		fallbackArgs := []string{"arrayjoin", leftTmp, rightTmp, outputSpec, "--across", "2"}
-		if err2 := runVipsCommand(ctx, vipsBinary, fallbackArgs); err2 != nil {
-			return fmt.Errorf("vips join failed: %v; fallback arrayjoin failed: %v", err, err2)
-		}
-	}
-
-	resp.Applied = true
-	resp.OutputPath = outputPath
-	resp.CompositionMode = "pair"
-	resp.ComposedFrom = []string{leftCand.ImagePath, rightCand.ImagePath}
-	return nil
-}
-
-func topTwoCandidates(candidates []ThumbnailCandidate) (ThumbnailCandidate, ThumbnailCandidate, bool) {
-	if len(candidates) < 2 {
-		return ThumbnailCandidate{}, ThumbnailCandidate{}, false
-	}
-	copied := make([]ThumbnailCandidate, 0, len(candidates))
-	copied = append(copied, candidates...)
-	sort.SliceStable(copied, func(i, j int) bool {
-		if math.Abs(copied[i].Score-copied[j].Score) <= 1e-9 {
-			return copied[i].PageIndex < copied[j].PageIndex
-		}
-		return copied[i].Score > copied[j].Score
-	})
-	return copied[0], copied[1], true
-}
-
-func generateCropForImageRatio(ctx context.Context, req ThumbnailRequest, imagePath string, ratio string) (CropResult, error) {
-	pageReq := req
-	pageReq.ImagePath = imagePath
-	pageReq.ImagePaths = nil
-	pageReq.ImageWidth = 0
-	pageReq.ImageHeight = 0
-	pageReq.PreferredRatio = ratio
-	pageReq.ApplyCrop = false
-	pageReq.OutputPath = ""
-	return GenerateThumbnailCrop(ctx, pageReq)
-}
-
-func retargetCropToSize(crop CropResult, targetW, targetH, imageW, imageH int) CropResult {
-	targetW = maxInt(1, targetW)
-	targetH = maxInt(1, targetH)
-	cx := crop.CropX + crop.CropWidth/2
-	cy := crop.CropY + crop.CropHeight/2
-	x := cx - targetW/2
-	y := cy - targetH/2
-	ratio := float64(targetW) / float64(targetH)
-	return ensureInBounds(x, y, targetW, targetH, imageW, imageH, ratio)
-}
-
-func normalizeQuality(quality int) int {
-	if quality <= 0 {
-		quality = 85
-	}
-	return minInt(maxInt(quality, 1), 100)
-}
-
-func runVipsCommand(ctx context.Context, vipsBinary string, args []string) error {
-	cmd := exec.CommandContext(ctx, vipsBinary, args...)
-	out, cmdErr := cmd.CombinedOutput()
-	if cmdErr != nil {
-		stderr := strings.TrimSpace(string(out))
-		if stderr != "" {
-			return fmt.Errorf("%v (%s)", cmdErr, stderr)
-		}
-		return cmdErr
-	}
-	return nil
-}
-
-func runVipsCropRaw(ctx context.Context, vipsBinary, inputPath, outputPath string, crop CropResult, quality int) error {
-	outputSpec := buildVipsOutputSpec(outputPath, quality)
-	args := []string{
-		"crop",
-		inputPath,
-		outputSpec,
-		strconv.Itoa(crop.CropX),
-		strconv.Itoa(crop.CropY),
-		strconv.Itoa(crop.CropWidth),
-		strconv.Itoa(crop.CropHeight),
-	}
-	if err := runVipsCommand(ctx, vipsBinary, args); err != nil {
-		return fmt.Errorf("vips crop failed: %w", err)
-	}
-	return nil
-}
-
-func cleanImagePaths(paths []string) []string {
-	out := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		out = append(out, path)
-	}
-	return out
-}
-
-func scoreCandidate(crop CropResult) float64 {
-	methodWeight := 0.5
-	switch strings.ToLower(strings.TrimSpace(crop.Method)) {
-	case "saliency":
-		methodWeight = 0.9
-	case "face":
-		methodWeight = 1.0
-	case "fallback":
-		methodWeight = 0.55
-	}
-	score := (0.75 * clamp(crop.Confidence, 0.0, 1.0)) + (0.25 * methodWeight)
-	return clamp(score, 0.0, 1.0)
-}
-
-func isBetterCandidate(score float64, pageIndex int, bestScore float64, bestPageIndex int) bool {
-	const eps = 1e-9
-	if bestPageIndex < 0 {
-		return true
-	}
-	if score > bestScore+eps {
-		return true
-	}
-	if math.Abs(score-bestScore) <= eps && pageIndex < bestPageIndex {
-		return true
-	}
-	return false
-}
-
-func buildVipsOutputSpec(outputPath string, quality int) string {
-	ext := strings.ToLower(filepath.Ext(outputPath))
-	switch ext {
-	case ".jpg", ".jpeg":
-		return fmt.Sprintf("%s[Q=%d,optimize_coding,strip]", outputPath, quality)
-	case ".webp":
-		return fmt.Sprintf("%s[Q=%d,strip]", outputPath, quality)
-	case ".png":
-		return fmt.Sprintf("%s[compression=6,strip]", outputPath)
-	default:
-		return outputPath
-	}
-}
-
-func parseWorkerOutput(output string) (CropResult, error) {
+func parseSmartPairOutput(output string) (smartPairResult, error) {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
-		return CropResult{}, errors.New("empty worker output")
+		return smartPairResult{}, errors.New("empty smart pair output")
 	}
 
-	var result CropResult
+	var result smartPairResult
 	if err := json.Unmarshal([]byte(trimmed), &result); err == nil {
+		if strings.TrimSpace(result.OutPath) == "" {
+			return smartPairResult{}, errors.New("smart pair output missing out_path")
+		}
 		return result, nil
 	}
 
@@ -609,10 +244,106 @@ func parseWorkerOutput(output string) (CropResult, error) {
 			continue
 		}
 		if err := json.Unmarshal([]byte(line), &result); err == nil {
+			if strings.TrimSpace(result.OutPath) == "" {
+				return smartPairResult{}, errors.New("smart pair output missing out_path")
+			}
 			return result, nil
 		}
 	}
-	return CropResult{}, errors.New("no JSON object found in worker output")
+	return smartPairResult{}, errors.New("no JSON object found in smart pair output")
+}
+
+func buildPairResponse(req ThumbnailRequest, pair smartPairResult, fallbackOutputPath string) ThumbnailResponse {
+	outPath := strings.TrimSpace(pair.OutPath)
+	if outPath == "" {
+		outPath = fallbackOutputPath
+	}
+
+	width := 1200
+	height := 675
+	if len(pair.Size) >= 2 {
+		if pair.Size[0] > 0 {
+			width = pair.Size[0]
+		}
+		if pair.Size[1] > 0 {
+			height = pair.Size[1]
+		}
+	}
+
+	resp := ThumbnailResponse{
+		CropResult: CropResult{
+			CropX:      0,
+			CropY:      0,
+			CropWidth:  width,
+			CropHeight: height,
+			Method:     "pair-smart-thumb",
+			Confidence: 1.0,
+		},
+		Applied:         true,
+		OutputPath:      outPath,
+		CompositionMode: "pair-smart-thumb",
+	}
+
+	candidates := make([]ThumbnailCandidate, 0, len(pair.Picked))
+	composedFrom := make([]string, 0, len(pair.Picked))
+	for i, picked := range pair.Picked {
+		if strings.TrimSpace(picked.Path) != "" {
+			composedFrom = append(composedFrom, picked.Path)
+		}
+
+		candidate := ThumbnailCandidate{
+			PageIndex:  picked.Idx,
+			ImagePath:  picked.Path,
+			Method:     "smart-thumb",
+			Confidence: clamp(1.0-picked.TextRatio, 0.0, 1.0),
+			Score:      picked.Total,
+		}
+		if len(picked.BBox) >= 4 {
+			x0 := picked.BBox[0]
+			y0 := picked.BBox[1]
+			x1 := picked.BBox[2]
+			y1 := picked.BBox[3]
+			candidate.CropX = x0
+			candidate.CropY = y0
+			candidate.CropWidth = maxInt(1, x1-x0)
+			candidate.CropHeight = maxInt(1, y1-y0)
+		}
+		candidates = append(candidates, candidate)
+
+		if i == 0 {
+			resp.SelectedImagePath = picked.Path
+			resp.SelectedScore = picked.Total
+			selectedIndex := picked.Idx
+			resp.SelectedPageIndex = &selectedIndex
+		}
+	}
+	resp.ComposedFrom = composedFrom
+	if req.ReturnCandidates {
+		resp.Candidates = candidates
+	}
+	return resp
+}
+
+func cleanImagePaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func resolveOutputPath(inputPath, outputPath string) string {
+	if strings.TrimSpace(outputPath) != "" {
+		return outputPath
+	}
+	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+	return filepath.Join(filepath.Dir(inputPath), base+"_thumb.jpg")
 }
 
 func pythonCandidates() []commandCandidate {
@@ -633,194 +364,16 @@ func pythonCandidates() []commandCandidate {
 	return candidates
 }
 
-func resolveDimensions(req ThumbnailRequest) (int, int) {
-	w, h := req.ImageWidth, req.ImageHeight
-	if w > 0 && h > 0 {
-		return w, h
+func envInt(name string, defaultValue int) int {
+	text := strings.TrimSpace(os.Getenv(name))
+	if text == "" {
+		return defaultValue
 	}
-	if strings.TrimSpace(req.ImagePath) == "" {
-		return maxInt(w, 0), maxInt(h, 0)
-	}
-
-	file, err := os.Open(req.ImagePath)
+	value, err := strconv.Atoi(text)
 	if err != nil {
-		return maxInt(w, 0), maxInt(h, 0)
+		return defaultValue
 	}
-	defer file.Close()
-
-	cfg, _, err := image.DecodeConfig(file)
-	if err != nil {
-		return maxInt(w, 0), maxInt(h, 0)
-	}
-
-	if w <= 0 {
-		w = cfg.Width
-	}
-	if h <= 0 {
-		h = cfg.Height
-	}
-	return maxInt(w, 0), maxInt(h, 0)
-}
-
-func fallbackCrop(width, height int, ratio float64) CropResult {
-	if width <= 0 || height <= 0 {
-		return CropResult{
-			CropX:      0,
-			CropY:      0,
-			CropWidth:  0,
-			CropHeight: 0,
-			Method:     "fallback",
-			Confidence: 0.0,
-		}
-	}
-
-	targetW := width
-	targetH := int(math.Round(float64(targetW) / ratio))
-	topBias := 0.18
-
-	if targetH <= height {
-		x := 0
-		y := int(math.Round(float64(height) * topBias))
-		if y+targetH > height {
-			y = maxInt(0, height-targetH)
-		}
-		return CropResult{
-			CropX:      x,
-			CropY:      y,
-			CropWidth:  targetW,
-			CropHeight: targetH,
-			Method:     "fallback",
-			Confidence: 0.0,
-		}
-	}
-
-	targetH = height
-	targetW = int(math.Round(float64(targetH) * ratio))
-	if targetW > width {
-		targetW = width
-		targetH = int(math.Round(float64(targetW) / ratio))
-		if targetH > height {
-			targetH = height
-		}
-	}
-
-	x := maxInt(0, (width-targetW)/2)
-	y := 0
-	return CropResult{
-		CropX:      x,
-		CropY:      y,
-		CropWidth:  targetW,
-		CropHeight: targetH,
-		Method:     "fallback",
-		Confidence: 0.0,
-	}
-}
-
-func ensureInBounds(x, y, w, h, imageW, imageH int, ratio float64) CropResult {
-	if imageW <= 0 || imageH <= 0 {
-		return CropResult{CropX: 0, CropY: 0, CropWidth: maxInt(w, 0), CropHeight: maxInt(h, 0)}
-	}
-
-	if w <= 0 || h <= 0 {
-		return fallbackCrop(imageW, imageH, ratio)
-	}
-
-	w = minInt(maxInt(w, 1), imageW)
-	h = minInt(maxInt(h, 1), imageH)
-	w, h = fitRatioSize(float64(w), float64(h), imageW, imageH, ratio)
-
-	x = minInt(maxInt(x, 0), imageW-w)
-	y = minInt(maxInt(y, 0), imageH-h)
-
-	return CropResult{
-		CropX:      x,
-		CropY:      y,
-		CropWidth:  w,
-		CropHeight: h,
-	}
-}
-
-func fitRatioSize(desiredW, desiredH float64, imageW, imageH int, ratio float64) (int, int) {
-	w := math.Max(1.0, desiredW)
-	h := math.Max(1.0, desiredH)
-
-	if w/h > ratio {
-		w = h * ratio
-	} else {
-		h = w / ratio
-	}
-
-	if w > float64(imageW) {
-		w = float64(imageW)
-		h = w / ratio
-	}
-	if h > float64(imageH) {
-		h = float64(imageH)
-		w = h * ratio
-	}
-
-	wi := minInt(maxInt(int(math.Round(w)), 1), imageW)
-	hi := minInt(maxInt(int(math.Round(h)), 1), imageH)
-
-	if float64(wi)/float64(hi) > ratio {
-		wi = minInt(maxInt(int(math.Round(float64(hi)*ratio)), 1), imageW)
-	} else {
-		hi = minInt(maxInt(int(math.Round(float64(wi)/ratio)), 1), imageH)
-	}
-
-	return wi, hi
-}
-
-func parseRatio(value interface{}) float64 {
-	if value == nil {
-		return defaultRatio
-	}
-
-	switch v := value.(type) {
-	case float64:
-		if v > 0 {
-			return v
-		}
-		return defaultRatio
-	case float32:
-		if v > 0 {
-			return float64(v)
-		}
-		return defaultRatio
-	case int:
-		if v > 0 {
-			return float64(v)
-		}
-		return defaultRatio
-	case json.Number:
-		n, err := v.Float64()
-		if err == nil && n > 0 {
-			return n
-		}
-		return defaultRatio
-	case string:
-		text := strings.TrimSpace(v)
-		if text == "" {
-			return defaultRatio
-		}
-		if strings.Contains(text, ":") {
-			parts := strings.SplitN(text, ":", 2)
-			if len(parts) == 2 {
-				left, lErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-				right, rErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-				if lErr == nil && rErr == nil && left > 0 && right > 0 {
-					return left / right
-				}
-			}
-		}
-		num, err := strconv.ParseFloat(text, 64)
-		if err == nil && num > 0 {
-			return num
-		}
-		return defaultRatio
-	default:
-		return defaultRatio
-	}
+	return value
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -830,7 +383,13 @@ func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
 }
 
 func clamp(v, low, high float64) float64 {
-	return math.Max(low, math.Min(high, v))
+	if v < low {
+		return low
+	}
+	if v > high {
+		return high
+	}
+	return v
 }
 
 func maxInt(a, b int) int {
@@ -838,19 +397,4 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func roundFloat(v float64, digits int) float64 {
-	if digits < 0 {
-		return v
-	}
-	factor := math.Pow(10, float64(digits))
-	return math.Round(v*factor) / factor
 }

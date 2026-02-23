@@ -18,12 +18,19 @@ RESP_FILE="${RESP_FILE:-$OUT_DIR/thumbnail_response.json}"
 PAYLOAD_FILE="${PAYLOAD_FILE:-$OUT_DIR/thumbnail_payload.json}"
 OUTPUT_IMAGE="${OUTPUT_IMAGE:-$OUT_DIR/chapter-thumbnail.jpg}"
 RUN_SAMPLE_TEST="${RUN_SAMPLE_TEST:-1}"
-SAMPLE_APPLY_CROP="${SAMPLE_APPLY_CROP:-1}"
 SAMPLE_COMPOSE_MODE="${SAMPLE_COMPOSE_MODE:-single}"
 AUTO_PORT_FALLBACK="${AUTO_PORT_FALLBACK:-1}"
 GO_VERSION="${GO_VERSION:-1.22.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-$HOME/.local}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/start_background_$(date +%Y%m%d_%H%M%S).log}"
+THUMBNAIL_YOLO_DEVICE="${THUMBNAIL_YOLO_DEVICE:-cpu}"
+SMART_THUMB_WORKER_PATH="${SMART_THUMB_WORKER_PATH:-$ROOT_DIR/smart_thumb.py}"
+
+if [[ "$THUMBNAIL_YOLO_DEVICE" == "cpu" ]]; then
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:--1}"
+fi
+export THUMBNAIL_YOLO_DEVICE
+export CUDA_VISIBLE_DEVICES
 
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$BIN_DIR" "$OUT_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -207,20 +214,6 @@ ensure_go() {
   command -v go >/dev/null 2>&1
 }
 
-ensure_vips_optional() {
-  command -v vips >/dev/null 2>&1 && return
-  local manager
-  manager="$(detect_pkg_manager)"
-  case "$manager" in
-    apt) install_packages "$manager" libvips-tools || true ;;
-    dnf|yum|pacman|zypper|apk|brew) install_packages "$manager" vips || true ;;
-    *) ;;
-  esac
-  if ! command -v vips >/dev/null 2>&1; then
-    echo "warning: vips is missing. sample test will run with apply_crop=false."
-  fi
-}
-
 create_or_repair_venv() {
   if [[ -d "$VENV_DIR" && ! -x "$VENV_DIR/bin/python3" ]]; then
     rm -rf "$VENV_DIR"
@@ -261,31 +254,32 @@ create_or_repair_venv() {
 }
 
 validate_worker_output() {
-  local worker_path="$ROOT_DIR/thumbnail_worker.py"
-  local sample_image
-  sample_image="$(find "$SAMPLE_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | sort | head -n 1 || true)"
+  local worker_path="$SMART_THUMB_WORKER_PATH"
+  local validate_out="$OUT_DIR/worker_validate.jpg"
+  mapfile -t sample_images < <(find "$SAMPLE_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | sort)
 
   if [[ ! -f "$worker_path" ]]; then
-    echo "thumbnail worker not found: $worker_path"
+    echo "smart pair worker not found: $worker_path"
     return 1
   fi
 
-  if [[ -z "${sample_image:-}" ]]; then
+  if [[ ${#sample_images[@]} -eq 0 ]]; then
     echo "Skipping worker validation because no sample image exists in $SAMPLE_DIR"
     return 0
   fi
 
-  python3 - "$worker_path" "$sample_image" <<'PY'
+  python3 - "$worker_path" "$validate_out" "${sample_images[@]}" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
 worker = sys.argv[1]
-image = sys.argv[2]
+out_file = sys.argv[2]
+images = sys.argv[3:]
 payload = {
-    "image_path": image,
-    "preferred_ratio": "16:9",
-    "max_analysis_size": 512,
+    "image_paths": images,
+    "output_path": out_file,
 }
 
 proc = subprocess.run(
@@ -306,21 +300,19 @@ try:
 except Exception as exc:  # noqa: BLE001
     raise SystemExit(f"worker output is not valid JSON: {exc}\nraw={raw!r}") from exc
 
-required = ["crop_x", "crop_y", "crop_width", "crop_height", "method", "confidence"]
+required = ["out_path", "size", "picked"]
 missing = [key for key in required if key not in data]
 if missing:
     raise SystemExit(f"worker output missing required fields: {missing}")
 
-if int(data["crop_width"]) <= 0 or int(data["crop_height"]) <= 0:
-    raise SystemExit(f"worker output has invalid crop size: {data}")
+out_path = str(data["out_path"]).strip()
+if not out_path:
+    raise SystemExit("worker output out_path is empty")
+if not os.path.isfile(out_path):
+    raise SystemExit(f"worker output file not found: {out_path}")
 
-print("Worker output validation: OK")
+print("Smart worker output validation: OK")
 PY
-}
-
-health_ok() {
-  local port="$1"
-  curl -fsS "http://$HOST:$port/healthz" >/dev/null 2>&1
 }
 
 port_is_listening() {
@@ -368,33 +360,22 @@ run_sample_test() {
     return 1
   fi
 
-  local apply_crop=0
-  if command -v vips >/dev/null 2>&1 && [[ "$SAMPLE_APPLY_CROP" == "1" ]]; then
-    apply_crop=1
-  fi
-
-  python3 - "$PAYLOAD_FILE" "$OUTPUT_IMAGE" "$apply_crop" "$SAMPLE_COMPOSE_MODE" "${IMAGES[@]}" <<'PY'
+  python3 - "$PAYLOAD_FILE" "$OUTPUT_IMAGE" "$SAMPLE_COMPOSE_MODE" "${IMAGES[@]}" <<'PY'
 import json
 import sys
 
 payload_path = sys.argv[1]
 output_image = sys.argv[2]
-apply_crop = sys.argv[3] == "1"
-compose_mode = sys.argv[4].strip().lower()
-image_paths = sys.argv[5:]
+compose_mode = sys.argv[3].strip().lower()
+image_paths = sys.argv[4:]
 
 payload = {
     "image_paths": image_paths,
-    "preferred_ratio": "16:9",
-    "max_analysis_size": 512,
-    "apply_crop": apply_crop,
-    "quality": 85,
+    "output_path": output_image,
     "return_candidates": True,
 }
 if compose_mode in ("single", "pair"):
     payload["compose_mode"] = compose_mode
-if apply_crop:
-    payload["output_path"] = output_image
 
 with open(payload_path, "w", encoding="utf-8") as fh:
     json.dump(payload, fh, indent=2)
@@ -429,15 +410,11 @@ if data.get("worker_warning"):
     print("Worker warning:", data.get("worker_warning"))
 PY
 
-  if [[ "$apply_crop" == "1" ]]; then
-    if [[ -f "$OUTPUT_IMAGE" ]]; then
-      echo "Sample thumbnail generated: $OUTPUT_IMAGE"
-    else
-      echo "Sample test failed: thumbnail file not generated."
-      return 1
-    fi
+  if [[ -f "$OUTPUT_IMAGE" ]]; then
+    echo "Sample thumbnail generated: $OUTPUT_IMAGE"
   else
-    echo "Sample test completed with apply_crop=false (vips missing or disabled)."
+    echo "Sample test failed: thumbnail file not generated."
+    return 1
   fi
 
   echo "Sample response: $RESP_FILE"
@@ -466,13 +443,11 @@ echo "Checking dependencies and auto-installing when missing..."
 ensure_curl
 ensure_python3
 ensure_go
-ensure_vips_optional
 echo "Using python: $(command -v python3)"
 echo "Using go: $(command -v go)"
-if command -v vips >/dev/null 2>&1; then
-  echo "Using vips: $(command -v vips)"
-fi
 echo "Using YOLO model: ${THUMBNAIL_YOLO_MODEL:-yolov8n.pt}"
+echo "Using YOLO device: ${THUMBNAIL_YOLO_DEVICE}"
+echo "Using smart pair worker: ${SMART_THUMB_WORKER_PATH}"
 if [[ -n "${ANIME_FACE_CASCADE_PATH:-}" ]]; then
   if [[ -f "$ANIME_FACE_CASCADE_PATH" ]]; then
     echo "Using face cascade model: $ANIME_FACE_CASCADE_PATH"
@@ -492,15 +467,8 @@ validate_worker_output
 
 go build -o "$BIN_PATH" .
 
-if health_ok "$PORT"; then
-  echo "Existing server is already healthy on http://$HOST:$PORT, reusing it."
-  run_sample_test
-  echo "Log: $LOG_FILE"
-  exit 0
-fi
-
 if port_is_listening "$PORT"; then
-  echo "Port $PORT is already in use but health check failed."
+  echo "Port $PORT is already in use."
   if [[ "$AUTO_PORT_FALLBACK" == "1" ]]; then
     NEW_PORT="$(find_available_port $((PORT + 1)) 50 || true)"
     if [[ -z "${NEW_PORT:-}" ]]; then
@@ -518,15 +486,15 @@ if port_is_listening "$PORT"; then
 fi
 
 echo "Starting server in background on http://$HOST:$PORT"
-nohup env PORT="$PORT" THUMBNAIL_WORKER_PATH="$ROOT_DIR/thumbnail_worker.py" "$BIN_PATH" >>"$LOG_FILE" 2>&1 &
+nohup env PORT="$PORT" SMART_THUMB_WORKER_PATH="$SMART_THUMB_WORKER_PATH" THUMBNAIL_YOLO_DEVICE="$THUMBNAIL_YOLO_DEVICE" CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$BIN_PATH" >>"$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" >"$PID_FILE"
 
 for _ in {1..30}; do
-  if curl -fsS "http://$HOST:$PORT/healthz" >/dev/null 2>&1; then
+  if port_is_listening "$PORT"; then
     echo "Server is running"
     echo "PID: $NEW_PID"
-    echo "Health: http://$HOST:$PORT/healthz"
+    echo "Endpoint: http://$HOST:$PORT/thumbnail"
     run_sample_test
     echo "Log: $LOG_FILE"
     exit 0

@@ -1,84 +1,44 @@
-# Smart Crop Image (Manga/Manhwa Thumbnail 16:9)
+# Smart Crop Image (Single Endpoint + Python Pair Composer)
 
-Project ini berisi arsitektur **Go + Python worker** untuk generate area crop thumbnail 16:9 secara otomatis, dengan prioritas karakter/wajah/area kontras tinggi dan fallback deterministik.
+Project ini memakai arsitektur **Go API + Python worker** dengan **satu endpoint** saja:
+
+- `POST /thumbnail`
+
+Endpoint tersebut akan:
+- memilih 2 halaman terbaik dari input chapter,
+- menggabungkannya menjadi thumbnail 16:9 di Python (`smart_thumb.py`),
+- mengembalikan metadata hasilnya.
 
 ## Struktur
 
 - `main.go`  
-  API Go (`POST /thumbnail`) yang memanggil worker Python, mengembalikan koordinat crop, dan opsional mengeksekusi crop final pakai `libvips`.
-- `thumbnail_worker.py`  
-  AI worker pipeline: `yolo -> saliency -> face -> fallback`.
-- `go.mod`  
-  Modul Go.
+  API Go single endpoint (`/thumbnail`) yang memanggil `smart_thumb.py`.
+- `smart_thumb.py`  
+  Worker Python untuk ranking halaman + merge 2 gambar jadi 16:9.
+- `scripts/start_background.sh`  
+  Script setup dependency, build, start background, dan sample test.
 
-## Pipeline (Python Worker)
+## Jalur Proses
 
-Urutan sesuai requirement:
+1. Client kirim request ke `POST /thumbnail`.
+2. Go menyiapkan payload worker (`image_paths`, `output_path`, parameter pair).
+3. Go memanggil `smart_thumb.py`.
+4. Python memilih 2 gambar terbaik dan menghasilkan file output merge 16:9.
+5. Go mengembalikan response JSON.
 
-1. Preprocess: load image, resize max-side 512 (analysis only), grayscale untuk analisis.
-2. YOLO (primary): deteksi objek utama untuk menentukan fokus crop.
-3. Saliency (secondary): SpectralResidual/OpenCV untuk fallback visual attention.
-4. Face detection (AI-assisted): cascade detector sebagai jalur tambahan untuk scene wajah dominan.
-5. Fallback deterministic (mandatory): top-biased crop (~18%), full width jika memungkinkan.
-6. Output JSON wajib (tidak pernah `null`, tidak di luar bounds).
-
-Output:
-
-```json
-{
-  "crop_x": 0,
-  "crop_y": 120,
-  "crop_width": 1080,
-  "crop_height": 608,
-  "method": "yolo",
-  "confidence": 0.79
-}
-```
-
-## Cara Pakai Worker Langsung
-
-Worker dipanggil oleh Go dengan kontrak CLI berikut:
-
-```bash
-python3 thumbnail_worker.py --input-json '{"image_path":"sample/01.webp","preferred_ratio":"16:9","max_analysis_size":512}'
-```
-
-Atau:
-
-```bash
-python3 thumbnail_worker.py --input-json-file payload.json
-```
-
-`thumbnail_worker.py` selalu mengeluarkan 1 JSON crop valid ke `stdout`.
-
-## Menjalankan API Go
+## Menjalankan API
 
 ```bash
 go run .
 ```
 
-Default listen di `:8080`.
+Server listen default di `:8080`.
 
-Health check:
-
-```bash
-curl http://localhost:8080/healthz
-```
-
-Atau pakai script background (install dependency + build + start):
+Atau pakai script:
 
 ```bash
 ./scripts/start_background.sh
 ```
-
-`start_background.sh` akan:
-- deteksi OS + arsitektur
-- auto-install dependency yang belum ada (`python3`, `go`, `curl`, dan mencoba `vips`)
-- membuat/repair virtualenv (dengan fallback jika `python3 -m venv` error)
-- validasi worker Python agar output JSON crop wajib selalu ada
-- menjalankan API di background (`nohup`)
-- otomatis test endpoint `/thumbnail` menggunakan semua gambar di folder `sample/`
-- menyimpan semua output (setup + server + test) ke **satu file log**: `logs/start_background_*.log`
 
 ## Request API
 
@@ -89,22 +49,7 @@ POST /thumbnail
 Content-Type: application/json
 ```
 
-Contoh payload (single image):
-
-```json
-{
-  "image_path": "D:/data/page-001.jpg",
-  "image_width": 1080,
-  "image_height": 1920,
-  "preferred_ratio": "16:9",
-  "max_analysis_size": 512,
-  "apply_crop": true,
-  "output_path": "D:/data/page-001-thumb.jpg",
-  "quality": 85
-}
-```
-
-Contoh payload (chapter banyak halaman):
+Contoh payload chapter:
 
 ```json
 {
@@ -113,145 +58,81 @@ Contoh payload (chapter banyak halaman):
     "D:/data/ch001/page-002.jpg",
     "D:/data/ch001/page-003.jpg"
   ],
-  "preferred_ratio": "16:9",
-  "max_analysis_size": 512,
-  "apply_crop": true,
   "output_path": "D:/data/ch001/ch001-thumb.jpg",
-  "quality": 85,
-  "return_candidates": true,
-  "compose_mode": "pair"
+  "return_candidates": true
 }
 ```
 
-Contoh `curl`:
+Payload juga bisa pakai `image_path` tunggal.  
+Jika hanya 1 gambar valid, worker akan duplikasi panel agar tetap jadi 16:9 pair output.
 
-```bash
-curl -X POST http://localhost:8080/thumbnail \
-  -H "Content-Type: application/json" \
-  -d "{\"image_path\":\"D:/data/page-001.jpg\",\"image_width\":1080,\"image_height\":1920,\"preferred_ratio\":\"16:9\",\"max_analysis_size\":512,\"apply_crop\":true,\"output_path\":\"D:/data/page-001-thumb.jpg\",\"quality\":85}"
-```
-
-Contoh response (chapter mode):
+## Response Contoh
 
 ```json
 {
-  "crop_x": 120,
-  "crop_y": 410,
-  "crop_width": 1080,
-  "crop_height": 608,
-  "method": "saliency",
-  "confidence": 0.81,
+  "crop_x": 0,
+  "crop_y": 0,
+  "crop_width": 1200,
+  "crop_height": 675,
+  "method": "pair-smart-thumb",
+  "confidence": 1,
   "applied": true,
   "output_path": "D:/data/ch001/ch001-thumb.jpg",
+  "composition_mode": "pair-smart-thumb",
+  "composed_from": [
+    "D:/data/ch001/page-003.jpg",
+    "D:/data/ch001/page-007.jpg"
+  ],
   "selected_page_index": 2,
   "selected_image_path": "D:/data/ch001/page-003.jpg",
-  "selected_score": 0.8575,
-  "candidates": [
-    {
-      "page_index": 0,
-      "image_path": "D:/data/ch001/page-001.jpg",
-      "crop_x": 0,
-      "crop_y": 334,
-      "crop_width": 1080,
-      "crop_height": 608,
-      "method": "fallback",
-      "confidence": 0,
-      "score": 0.1375
-    }
-  ]
+  "selected_score": 1.9821
 }
 ```
 
-Jika crop file gagal (mis. `vips` belum terpasang), API tetap mengembalikan koordinat + field `crop_error`.
+Jika worker gagal, API tetap merespons dengan `crop_error`.
 
-Untuk chapter portrait panjang, `compose_mode: "pair"` akan mencoba menggabungkan 2 halaman kandidat terbaik secara horizontal menjadi output 16:9.
+## Sample Test
 
-## Test Dengan Folder `/sample`
-
-Test sample sekarang otomatis dijalankan oleh:
-
-```bash
-./scripts/start_background.sh
-```
-
-Taruh file gambar chapter (jpg/png/webp) di folder `sample/` sebelum menjalankan script.  
-Kalau ingin start API tanpa test sample:
-
-```bash
-RUN_SAMPLE_TEST=0 ./scripts/start_background.sh
-```
-
-Untuk test sample mode gabung 2 halaman:
+Jalankan:
 
 ```bash
 SAMPLE_COMPOSE_MODE=pair ./scripts/start_background.sh
 ```
 
-Output yang dihasilkan:
-- response JSON di `sample/out/thumbnail_response.json`
-- payload yang dipakai di `sample/out/thumbnail_payload.json`
-- thumbnail hasil crop di `sample/out/chapter-thumbnail.jpg`
-- satu file log terpadu di `logs/start_background_*.log`
+Output sample:
+- `sample/out/thumbnail_response.json`
+- `sample/out/thumbnail_payload.json`
+- `sample/out/chapter-thumbnail.jpg`
+- `logs/start_background_*.log`
 
 ## Environment Variables
 
 - `PORT`  
   Port API Go. Default `8080`.
-- `RUN_SAMPLE_TEST`  
-  `1` (default) untuk auto-test sample, `0` untuk skip test.
-- `SAMPLE_APPLY_CROP`  
-  `1` (default) untuk test dengan crop fisik jika `vips` tersedia, `0` untuk test koordinat saja.
-- `SAMPLE_COMPOSE_MODE`  
-  `single` (default) atau `pair` untuk mode test sample.
-- `AUTO_PORT_FALLBACK`  
-  `1` (default) jika port dipakai proses lain maka otomatis pindah ke port kosong berikutnya.
-- `LOG_FILE`  
-  Path log gabungan. Default `logs/start_background_<timestamp>.log`.
-- `THUMBNAIL_WORKER_PATH`  
-  Path ke file worker Python. Default `thumbnail_worker.py`.
 - `PYTHON_BIN`  
   Command Python custom, contoh: `python` atau `py -3`.
-- `ANIME_FACE_CASCADE_PATH`  
-  Path cascade XML anime face (opsional, dibaca oleh worker Python).
+- `SMART_THUMB_WORKER_PATH`  
+  Path worker pair Python. Default `smart_thumb.py`.
 - `THUMBNAIL_YOLO_MODEL`  
-  Path/nama model YOLO untuk worker. Default `yolov8n.pt`.
-- `THUMBNAIL_YOLO_CONF`  
-  Confidence threshold YOLO. Default `0.22`.
-- `THUMBNAIL_YOLO_IOU`  
-  IoU threshold YOLO NMS. Default `0.50`.
-- `THUMBNAIL_YOLO_MAX_DET`  
-  Jumlah maksimum deteksi YOLO. Default `40`.
-- `THUMBNAIL_YOLO_TARGETS`  
-  Daftar keyword class prioritas (comma-separated).
-- `THUMBNAIL_YOLO_AVOID`  
-  Daftar keyword class yang dipenalti (comma-separated).
-- `apply_crop` / `output_path` / `quality` (di body request)  
-  Mengaktifkan crop fisik dengan `vips crop`. Jika `output_path` kosong dan `apply_crop=true`, nama default: `<nama_file>_thumb.<ext>`.
-- `image_paths` (di body request)  
-  Untuk mode chapter. API akan evaluasi tiap halaman, lalu pilih halaman terbaik secara deterministik.
-- `return_candidates` (di body request)  
-  Jika `true`, response menyertakan daftar skor tiap halaman (`candidates`).
-- `compose_mode` (di body request)  
-  `single` (default) atau `pair`. Mode `pair` menggabungkan 2 halaman terbaik (side-by-side) untuk thumbnail 16:9.
+  Model YOLO untuk worker pair. Default di worker: `yoloe-26s-seg.pt`.
+- `THUMBNAIL_YOLO_DEVICE`  
+  Device inference. Default `cpu`.
+- `THUMBNAIL_PAIR_SKIP_EDGES`  
+  Parameter `skip_edges`. Default `2`.
+- `THUMBNAIL_PAIR_GAP`  
+  Jarak antar panel. Default `5`.
+- `THUMBNAIL_PAIR_WIDTH`  
+  Lebar output. Default `1200`.
 
 ## Dependency Runtime
 
-- Python + package:
+- Python packages:
   - `numpy`
   - `Pillow`
   - `opencv-contrib-python-headless`
   - `ultralytics`
-- `libvips` CLI (`vips`) harus tersedia di PATH jika ingin `apply_crop=true`.
-
-## Catatan Integrasi
-
-- Jika worker Python gagal dijalankan, Go otomatis mengembalikan fallback crop deterministik.
-- Jika crop fisik gagal, koordinat tetap dikembalikan dan error ada di field `crop_error`.
-- Untuk chapter, output crop final selalu diambil dari halaman terpilih (`selected_image_path`).
 
 ## Build Check
-
-Sudah diverifikasi:
 
 ```bash
 gofmt -w main.go
