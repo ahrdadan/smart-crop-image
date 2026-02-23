@@ -260,6 +260,64 @@ create_or_repair_venv() {
   python3 -m venv "$VENV_DIR"
 }
 
+validate_worker_output() {
+  local worker_path="$ROOT_DIR/thumbnail_worker.py"
+  local sample_image
+  sample_image="$(find "$SAMPLE_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | sort | head -n 1 || true)"
+
+  if [[ ! -f "$worker_path" ]]; then
+    echo "thumbnail worker not found: $worker_path"
+    return 1
+  fi
+
+  if [[ -z "${sample_image:-}" ]]; then
+    echo "Skipping worker validation because no sample image exists in $SAMPLE_DIR"
+    return 0
+  fi
+
+  python3 - "$worker_path" "$sample_image" <<'PY'
+import json
+import subprocess
+import sys
+
+worker = sys.argv[1]
+image = sys.argv[2]
+payload = {
+    "image_path": image,
+    "preferred_ratio": "16:9",
+    "max_analysis_size": 512,
+}
+
+proc = subprocess.run(
+    [sys.executable, worker, "--input-json", json.dumps(payload)],
+    capture_output=True,
+    text=True,
+)
+if proc.returncode != 0:
+    raise SystemExit(f"worker exited with non-zero status: {proc.returncode}\n{proc.stderr}")
+
+raw = proc.stdout.strip()
+if not raw:
+    raise SystemExit("worker output is empty")
+
+line = raw.splitlines()[-1].strip()
+try:
+    data = json.loads(line)
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(f"worker output is not valid JSON: {exc}\nraw={raw!r}") from exc
+
+required = ["crop_x", "crop_y", "crop_width", "crop_height", "method", "confidence"]
+missing = [key for key in required if key not in data]
+if missing:
+    raise SystemExit(f"worker output missing required fields: {missing}")
+
+if int(data["crop_width"]) <= 0 or int(data["crop_height"]) <= 0:
+    raise SystemExit(f"worker output has invalid crop size: {data}")
+
+print("Worker output validation: OK")
+PY
+}
+
 health_ok() {
   local port="$1"
   curl -fsS "http://$HOST:$port/healthz" >/dev/null 2>&1
@@ -353,6 +411,11 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     data = json.load(fh)
 
+required = ["crop_x", "crop_y", "crop_width", "crop_height", "method", "confidence"]
+missing = [key for key in required if key not in data]
+if missing:
+    raise SystemExit(f"invalid API response, missing fields: {missing}")
+
 print("Sample test result")
 print("Selected page index:", data.get("selected_page_index"))
 print("Selected image path:", data.get("selected_image_path"))
@@ -409,14 +472,15 @@ echo "Using go: $(command -v go)"
 if command -v vips >/dev/null 2>&1; then
   echo "Using vips: $(command -v vips)"
 fi
-if [[ -n "${ANIME_FACE_ONNX_PATH:-}" ]]; then
-  if [[ -f "$ANIME_FACE_ONNX_PATH" ]]; then
-    echo "Using AI face model: $ANIME_FACE_ONNX_PATH"
+echo "Using YOLO model: ${THUMBNAIL_YOLO_MODEL:-yolov8n.pt}"
+if [[ -n "${ANIME_FACE_CASCADE_PATH:-}" ]]; then
+  if [[ -f "$ANIME_FACE_CASCADE_PATH" ]]; then
+    echo "Using face cascade model: $ANIME_FACE_CASCADE_PATH"
   else
-    echo "warning: ANIME_FACE_ONNX_PATH is set but file not found: $ANIME_FACE_ONNX_PATH"
+    echo "warning: ANIME_FACE_CASCADE_PATH is set but file not found: $ANIME_FACE_CASCADE_PATH"
   fi
 else
-  echo "warning: ANIME_FACE_ONNX_PATH not set. Worker will use cascade fallback for face detection."
+  echo "warning: ANIME_FACE_CASCADE_PATH not set. Worker will use OpenCV default cascade model."
 fi
 
 create_or_repair_venv
@@ -424,6 +488,7 @@ create_or_repair_venv
 source "$VENV_DIR/bin/activate"
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
+validate_worker_output
 
 go build -o "$BIN_PATH" .
 

@@ -628,6 +628,7 @@ func pythonCandidates() []commandCandidate {
 		}
 	}
 	candidates = append(candidates, commandCandidate{Bin: "python"})
+	candidates = append(candidates, commandCandidate{Bin: "python3"})
 	candidates = append(candidates, commandCandidate{Bin: "py", Args: []string{"-3"}})
 	return candidates
 }

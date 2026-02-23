@@ -7,7 +7,7 @@ Project ini berisi arsitektur **Go + Python worker** untuk generate area crop th
 - `main.go`  
   API Go (`POST /thumbnail`) yang memanggil worker Python, mengembalikan koordinat crop, dan opsional mengeksekusi crop final pakai `libvips`.
 - `thumbnail_worker.py`  
-  AI worker pipeline: `saliency -> face -> fallback`.
+  AI worker pipeline: `yolo -> saliency -> face -> fallback`.
 - `go.mod`  
   Modul Go.
 
@@ -16,10 +16,11 @@ Project ini berisi arsitektur **Go + Python worker** untuk generate area crop th
 Urutan sesuai requirement:
 
 1. Preprocess: load image, resize max-side 512 (analysis only), grayscale untuk analisis.
-2. Saliency (primary): SpectralResidual/OpenCV, top saliency, expand ke 16:9, score confidence + penalti area text/balloon.
-3. Face detection (AI-assisted): model ONNX (`onnxruntime`, CPU) diprioritaskan, lalu fallback ke cascade. Jika area saliency berisiko balloon-text, face dapat override.
-4. Fallback deterministic (mandatory): top-biased crop (~18%), full width jika memungkinkan.
-5. Output JSON wajib (tidak pernah `null`, tidak di luar bounds).
+2. YOLO (primary): deteksi objek utama untuk menentukan fokus crop.
+3. Saliency (secondary): SpectralResidual/OpenCV untuk fallback visual attention.
+4. Face detection (AI-assisted): cascade detector sebagai jalur tambahan untuk scene wajah dominan.
+5. Fallback deterministic (mandatory): top-biased crop (~18%), full width jika memungkinkan.
+6. Output JSON wajib (tidak pernah `null`, tidak di luar bounds).
 
 Output:
 
@@ -29,10 +30,26 @@ Output:
   "crop_y": 120,
   "crop_width": 1080,
   "crop_height": 608,
-  "method": "saliency",
-  "confidence": 0.81
+  "method": "yolo",
+  "confidence": 0.79
 }
 ```
+
+## Cara Pakai Worker Langsung
+
+Worker dipanggil oleh Go dengan kontrak CLI berikut:
+
+```bash
+python3 thumbnail_worker.py --input-json '{"image_path":"sample/01.webp","preferred_ratio":"16:9","max_analysis_size":512}'
+```
+
+Atau:
+
+```bash
+python3 thumbnail_worker.py --input-json-file payload.json
+```
+
+`thumbnail_worker.py` selalu mengeluarkan 1 JSON crop valid ke `stdout`.
 
 ## Menjalankan API Go
 
@@ -58,6 +75,7 @@ Atau pakai script background (install dependency + build + start):
 - deteksi OS + arsitektur
 - auto-install dependency yang belum ada (`python3`, `go`, `curl`, dan mencoba `vips`)
 - membuat/repair virtualenv (dengan fallback jika `python3 -m venv` error)
+- validasi worker Python agar output JSON crop wajib selalu ada
 - menjalankan API di background (`nohup`)
 - otomatis test endpoint `/thumbnail` menggunakan semua gambar di folder `sample/`
 - menyimpan semua output (setup + server + test) ke **satu file log**: `logs/start_background_*.log`
@@ -195,8 +213,18 @@ Output yang dihasilkan:
   Command Python custom, contoh: `python` atau `py -3`.
 - `ANIME_FACE_CASCADE_PATH`  
   Path cascade XML anime face (opsional, dibaca oleh worker Python).
-- `ANIME_FACE_ONNX_PATH`  
-  Path model ONNX face/anime-face detector (opsional, prioritas utama untuk AI-assisted detection).
+- `THUMBNAIL_YOLO_MODEL`  
+  Path/nama model YOLO untuk worker. Default `yolov8n.pt`.
+- `THUMBNAIL_YOLO_CONF`  
+  Confidence threshold YOLO. Default `0.22`.
+- `THUMBNAIL_YOLO_IOU`  
+  IoU threshold YOLO NMS. Default `0.50`.
+- `THUMBNAIL_YOLO_MAX_DET`  
+  Jumlah maksimum deteksi YOLO. Default `40`.
+- `THUMBNAIL_YOLO_TARGETS`  
+  Daftar keyword class prioritas (comma-separated).
+- `THUMBNAIL_YOLO_AVOID`  
+  Daftar keyword class yang dipenalti (comma-separated).
 - `apply_crop` / `output_path` / `quality` (di body request)  
   Mengaktifkan crop fisik dengan `vips crop`. Jika `output_path` kosong dan `apply_crop=true`, nama default: `<nama_file>_thumb.<ext>`.
 - `image_paths` (di body request)  
@@ -212,7 +240,7 @@ Output yang dihasilkan:
   - `numpy`
   - `Pillow`
   - `opencv-contrib-python-headless`
-  - `onnxruntime`
+  - `ultralytics`
 - `libvips` CLI (`vips`) harus tersedia di PATH jika ingin `apply_crop=true`.
 
 ## Catatan Integrasi
