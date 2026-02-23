@@ -11,6 +11,8 @@ FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
     PORT=8080 \
     PYTHON_BIN=python3 \
     SMART_THUMB_WORKER_PATH=/app/smart_thumb.py \
